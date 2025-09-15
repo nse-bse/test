@@ -1,24 +1,19 @@
 # app/ui/app_main.py
-
 import time
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+import json
+import requests
 
-# Soft dependency: heartbeat (re-run without full reload)
-try:
-    from streamlit_autorefresh import st_autorefresh
-except Exception:
-    st_autorefresh = None
-
-# ------------------ local modules (per your refactor layout) ------------------
-
+# ------------------ local modules ------------------
 from config import (
     now_ist, IST,
     NIFTY_HISTORICAL_EXPIRIES, BANKNIFTY_HISTORICAL_EXPIRIES,
+    FNO_STOCKS, INDEX_SYMBOLS,
 )
 from utils.time_utils import market_bounds, next_refresh_in_seconds, on_market_tick
 from data.api import (
@@ -40,7 +35,9 @@ from features.gamma_and_rails import (
     compute_gamma_regime, compute_iv_rails, detect_stop_hunt, score_zones,
     summarize_zones, summarize_trade_bias, build_trade_commentary, _format_zone_list,
 )
-from features.money_map import compute_money_map, money_center_of_mass, find_walls, make_money_map_commentary
+from features.money_map import (
+    compute_money_map, money_center_of_mass, find_walls, make_money_map_commentary
+)
 from features.liquidity import (
     compute_spread_stats, impact_cost_proxy, liquidity_stress, gex_curve,
     realized_vol_annualized, pcr_vol, make_quick_execution_commentary,
@@ -50,26 +47,91 @@ from features.runway import (
 )
 from ui.styling import style_chain, movers_chart, net_oi_change_chart, style_mover_table
 
+# Predictive layer
+from features.predict import (
+    expected_move_nowcast, pin_probability, breakout_probabilities,
+    wall_shift_velocity, session_phase,
+)
+
+# Soft dependency: heartbeat
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
+
 
 # ---------------------------- helpers ----------------------------
+def _isnum(x):
+    return isinstance(x, (int, float)) and np.isfinite(x)
 
 @st.cache_data(show_spinner=False, ttl=300)
 def _load_expiries_for_session(source: str, symbol: str, api_base: str):
-    """Unifies live + historical lists when in Historical mode."""
+    """Unifies live + historical lists when in Historical mode. Stocks fallback → BANKNIFTY monthly."""
     if source == "Live API":
         return load_expiries(api_base, symbol)
-    else:
-        live_expiries, _ = load_expiries(api_base, symbol)
-        historical = NIFTY_HISTORICAL_EXPIRIES if symbol == "NIFTY" else BANKNIFTY_HISTORICAL_EXPIRIES
-        try:
-            all_exps = sorted(
-                set(live_expiries) | set(historical),
-                key=lambda x: datetime.strptime(x, "%d%b%y"),
-                reverse=True,
-            )
-        except Exception:
-            all_exps = sorted(set(live_expiries) | set(historical), reverse=True)
-        return all_exps, None
+    live_expiries, _ = load_expiries(api_base, symbol)
+    historical = NIFTY_HISTORICAL_EXPIRIES if symbol == "NIFTY" else BANKNIFTY_HISTORICAL_EXPIRIES
+    try:
+        all_exps = sorted(
+            set(live_expiries) | set(historical),
+            key=lambda x: datetime.strptime(x, "%d%b%y"),
+            reverse=True,
+        )
+    except Exception:
+        all_exps = sorted(set(live_expiries) | set(historical), reverse=True)
+    return all_exps, None
+
+
+def _direction_score(
+    regime: str,
+    iv_z: Optional[float],
+    vel_df: pd.DataFrame,
+    up_tbl: Optional[pd.DataFrame],
+    down_tbl: Optional[pd.DataFrame],
+    net_iv_flow: Optional[float],
+    pcr_window: float
+) -> int:
+    """
+    Lightweight 0–100 score: >60 trend/break bias; <40 mean-revert bias.
+    Components: gamma regime, IV impulse, velocity tilt, gates edge, IV-flow, PCR tilt.
+    """
+    score = 50.0
+
+    # Gamma regime
+    if regime:
+        if "Short" in regime: score += 12
+        elif "Long" in regime: score -= 12
+
+    # IV impulse: more |z| pushes away from mean-revert; sign adds direction only via velocity/gates
+    if iv_z is not None and np.isfinite(iv_z):
+        score += np.clip(abs(iv_z), 0, 3.0) * 6.0  # up to +18 when vol is impulsive
+
+    # Velocity tilt
+    if vel_df is not None and not vel_df.empty and "velocity" in vel_df.columns:
+        up_v = float(vel_df.loc[vel_df["velocity"] > 0, "velocity"].sum())
+        dn_v = float(-vel_df.loc[vel_df["velocity"] < 0, "velocity"].sum())
+        total = up_v + dn_v
+        if total > 0:
+            tilt = (up_v - dn_v) / total  # -1..+1
+            score += float(tilt) * 10.0
+
+    # Gates edge
+    try:
+        up_edge = float(up_tbl["score"].mean()) if (up_tbl is not None and not up_tbl.empty) else 0.0
+        dn_edge = float(down_tbl["score"].mean()) if (down_tbl is not None and not down_tbl.empty) else 0.0
+        score += np.tanh((up_edge - dn_edge) / 5.0) * 10.0
+    except Exception:
+        pass
+
+    # IV flow: net vol buying/selling
+    if net_iv_flow is not None and np.isfinite(net_iv_flow):
+        score += np.tanh(net_iv_flow / 5e6) * 6.0
+
+    # PCR tilt: very low/high moves score from neutrality
+    if np.isfinite(pcr_window):
+        score += np.tanh((pcr_window - 1.0) * 1.5) * 6.0
+
+    return int(np.clip(round(score), 0, 100))
 
 
 # ------------------------------ app ------------------------------
@@ -81,24 +143,31 @@ def render_app():
     ss.setdefault("snapshot", None)
     ss.setdefault("last_live_digest", None)
     ss.setdefault("last_hist_digest", None)
-    ss.setdefault("spot_hist", {})  # {f"{sym}:{exp}": deque([...])}
+    ss.setdefault("spot_hist", {})  # {f"{sym}:{exp}": [spot,...]}
     ss.setdefault("api_hits", 0)
 
     # Historical manual control state
     ss.setdefault("hist_date_pending", datetime.today().date())
     ss.setdefault("hist_time_pending", "15:30")
-    ss.setdefault("hist_sel_key", None)   # (api_base, symbol, expiry) when in Historical
-    ss.setdefault("current_source", None) # track source transitions
+    ss.setdefault("hist_sel_key", None)
+    ss.setdefault("current_source", None)
 
     # ---- sidebar: source & symbol ----
     st.sidebar.header("Data Source & Symbol")
     source = st.sidebar.selectbox("Source", ["Live API", "Historical API"], index=0)
     api_base = st.sidebar.text_input("API Base", value="http://127.0.0.1:8000")
-    symbol = st.sidebar.selectbox("Symbol", ["NIFTY", "BANKNIFTY"], index=0)
+    inst = st.sidebar.radio("Instrument", ["Index", "Stock"], index=0, horizontal=True)
+
+    if inst == "Index":
+        symbol = st.sidebar.selectbox("Symbol", ["NIFTY", "BANKNIFTY"], index=0)
+    else:
+        default_idx = FNO_STOCKS.index("RELIANCE") if "RELIANCE" in FNO_STOCKS else 0
+        symbol = st.sidebar.selectbox("Symbol", FNO_STOCKS, index=default_idx)
+    symbol = symbol.strip().upper()
 
     expiry_list, warn_msg = _load_expiries_for_session(source, symbol, api_base)
     if warn_msg:
-       st.sidebar.warning(f"Could not fetch expiries from API. Using static list. Reason: {warn_msg}")
+        st.sidebar.warning(f"Could not fetch expiries from API. Using static list. Reason: {warn_msg}")
     expiry = st.sidebar.selectbox("Expiry", expiry_list, index=0)
 
     st.sidebar.header("Live cadence")
@@ -109,49 +178,19 @@ def render_app():
         "Refresh interval (seconds for Fixed)", min_value=10, max_value=600, value=180, step=10
     )
 
-    # default to Cash (API) for index symbols; else keep Futures
-    _index_syms = {"NIFTY", "BANKNIFTY", "NIFTY 50", "NIFTY BANK", "NIFTY-I", "BANKNIFTY-I"}
-    _default_spot_idx = 1 if symbol.upper() in _index_syms else 0
+    # Default: Cash (API) for indices; Futures for stocks
+    _default_spot_idx = 1 if symbol in INDEX_SYMBOLS else 0
     spot_source = st.sidebar.selectbox(
         "Use spot as",
         ["Futures (from OC snapshot)", "Cash (API)", "Cash (estimate via parity)"],
         index=_default_spot_idx,
     )
 
-
-    # ---------- Historical controls (manual-only; no auto-fetch) ----------
-    if source == "Historical API":
-        with st.sidebar.expander("Historical Settings", expanded=True):
-            base_date = st.date_input("Date", key="hist_date_pending", value=ss["hist_date_pending"])
-
-            def _slots(start="09:15", end="15:30", step=3):
-                slots = []
-                cur = datetime.strptime(start, "%H:%M")
-                end_t = datetime.strptime(end, "%H:%M")
-                while cur <= end_t:
-                    slots.append(cur.strftime("%H:%M"))
-                    cur += timedelta(minutes=step)
-                return slots
-
-            all_times = _slots()
-            try:
-                default_idx = all_times.index(ss.get("hist_time_pending", "15:30"))
-            except ValueError:
-                default_idx = len(all_times) - 1
-            sel_time = st.selectbox("Time (HH:MM)", all_times, index=default_idx, key="hist_time_select")
-            ss["hist_time_pending"] = sel_time
-
-            fetch_hist_now = st.button("Fetch Historical Snapshot", use_container_width=True)
-            st.caption("Changing Date/Time does not update the view. Click **Fetch** to load that snapshot.")
-    else:
-        # Live only
-        auto = st.sidebar.checkbox("Auto refresh", value=True)
-        fetch_live_now = st.sidebar.button("Fetch Live Snapshot")
-
+    # ---- view controls ----
     st.sidebar.header("View")
-    strike_window = st.sidebar.slider("± Strikes around ATM", 5, 40, 15, 1)
-    with st.sidebar.expander("Analytics Ring Settings"):
-        fixed_skew_ring = st.number_input("Ring size (± strikes)", 5, 25, 10, 1)
+    strike_window = st.sidebar.slider("± Strikes around ATM", min_value=5, max_value=40, value=15, step=1)
+    with st.sidebar.expander("Analytics Ring Settings", expanded=False):
+        fixed_skew_ring = st.number_input("Ring size (± strikes)", min_value=5, max_value=25, value=10, step=1)
     with st.sidebar.expander("Heatmap Settings", expanded=True):
         enable_heatmap = st.checkbox("Enable heatmaps", value=True)
         available_metric_choices = ["oi_change", "oi", "volume", "ltp", "net_oi_change"]
@@ -161,9 +200,9 @@ def render_app():
             default=["oi_change", "oi", "net_oi_change"],
         )
 
-    # Heartbeat (re-run without full reload)
+    # Heartbeat (rerun)
     if st_autorefresh:
-        hb = st_autorefresh(interval=30000, key="heartbeat")  # ~1s
+        hb = st_autorefresh(interval=40000, key="heartbeat")
         st.sidebar.caption(f"🫀 heartbeat #{hb}")
     else:
         st.sidebar.warning("`streamlit-autorefresh` not installed → no timed re-runs.")
@@ -174,7 +213,6 @@ def render_app():
     if source == "Historical API":
         sel_key = (api_base, symbol, expiry)
         if prev_source != "Historical API" or ss.get("hist_sel_key") != sel_key:
-            # entering Historical or changing (api_base, symbol, expiry) while in Historical
             ss["hist_sel_key"] = sel_key
             ss["snapshot"] = None
             ss["last_hist_digest"] = None
@@ -186,9 +224,9 @@ def render_app():
     did_fetch = False
 
     if source == "Live API" and ss.get("last_fetch") is not None:
-        auto_val = auto if "auto" in locals() else False
-
-        if auto_val:
+        auto = st.sidebar.checkbox("Auto refresh", value=True)
+        fetch_live_now = st.sidebar.button("Fetch Live Snapshot")
+        if auto:
             if cadence_mode.startswith("Market"):
                 seconds_to_next_tick = next_refresh_in_seconds(now)
                 should_fetch = on_market_tick(now, ss["last_fetch"])
@@ -198,26 +236,34 @@ def render_app():
                 should_fetch = elapsed >= refresh_sec
         else:
             should_fetch = False
-
-        if "fetch_live_now" in locals() and fetch_live_now:
-            should_fetch = True
-
+        if fetch_live_now: should_fetch = True
         if should_fetch:
             ss["snapshot"] = load_snapshot_from_api(api_base, symbol, expiry)
             ss["last_fetch"] = time.time()
             ss["last_live_digest"] = snapshot_digest(ss["snapshot"]) if ss["snapshot"] else None
             ss["api_hits"] += 1
             did_fetch = True
-            # recompute next tick label
             now = now_ist()
-            if cadence_mode.startswith("Market"):
-                seconds_to_next_tick = next_refresh_in_seconds(now)
-            else:
-                seconds_to_next_tick = int(refresh_sec)
+            seconds_to_next_tick = next_refresh_in_seconds(now) if cadence_mode.startswith("Market") else int(refresh_sec)
 
     elif source == "Historical API":
-        # Manual fetch only
-        if "fetch_hist_now" in locals() and fetch_hist_now:
+        with st.sidebar.expander("Historical Settings", expanded=True):
+            _ = st.date_input("Date", key="hist_date_pending", value=ss["hist_date_pending"])
+            def _slots(start="09:15", end="15:30", step=3):
+                slots, cur, end_t = [], datetime.strptime(start, "%H:%M"), datetime.strptime(end, "%H:%M")
+                while cur <= end_t:
+                    slots.append(cur.strftime("%H:%M")); cur += timedelta(minutes=step)
+                return slots
+            all_times = _slots()
+            try:
+                default_idx = all_times.index(ss.get("hist_time_pending", "15:30"))
+            except ValueError:
+                default_idx = len(all_times) - 1
+            sel_time = st.selectbox("Time (HH:MM)", all_times, index=default_idx, key="hist_time_select")
+            ss["hist_time_pending"] = sel_time
+            fetch_hist_now = st.button("Fetch Historical Snapshot", use_container_width=True)
+            st.caption("Changing Date/Time does not update the view. Click **Fetch** to load that snapshot.")
+        if fetch_hist_now:
             pending_date = ss.get("hist_date_pending", datetime.today().date())
             pending_time = ss.get("hist_time_pending", "15:30")
             ss["snapshot"] = load_snapshot_from_hist_api(
@@ -229,27 +275,18 @@ def render_app():
 
     snapshot = ss["snapshot"]
     if snapshot is None:
-        if source == "Historical API":
-            st.title("Option Chain Dashboard")
-            topL, topR = st.columns([3,1])
-            with topL:
-                st.caption("No historical snapshot loaded. Choose **Date/Time** and click **Fetch Historical Snapshot**.")
-            with topR:
-                st.metric("API hits (session)", ss.get("api_hits", 0))
-            return
-        else:
-            st.title("Option Chain Dashboard")
-            topL, topR = st.columns([3,1])
-            with topL:
-                st.caption("Waiting for first live fetch…")
-                if seconds_to_next_tick is not None:
-                    st.caption(
-                        f"Next auto-fetch in ~{seconds_to_next_tick}s → "
-                        f"at **{(now + timedelta(seconds=seconds_to_next_tick)).strftime('%H:%M:%S')} IST**"
-                    )
-            with topR:
-                st.metric("API hits (session)", ss.get("api_hits", 0))
-            return  # stop until we have a snapshot
+        st.title("Option Chain Dashboard")
+        left, right = st.columns([3,1])
+        with left:
+            st.caption("No snapshot yet." if source == "Historical API" else "Waiting for first live fetch…")
+            if seconds_to_next_tick is not None:
+                st.caption(
+                    f"Next auto-fetch in ~{seconds_to_next_tick}s → "
+                    f"at **{(now + timedelta(seconds=seconds_to_next_tick)).strftime('%H:%M:%S')} IST**"
+                )
+        with right:
+            st.metric("API hits (session)", ss.get("api_hits", 0))
+        return
 
     # ---- processing ----
     sym = snapshot.get("symbol", symbol)
@@ -257,18 +294,34 @@ def render_app():
     ts = snapshot.get("timestamp", "?")
 
     df, fut_spot, all_fields = group_chain(snapshot)
-    working_spot = fut_spot
+
+    # Spot routing
     cash_spot = None
-    if spot_source == "Cash (API)":
-        cash_spot = load_cash_spot_from_api(api_base, symbol)
+    if symbol in FNO_STOCKS:  # STOCKS → always Cash(API)
+        cash_spot = load_cash_spot_from_api(api_base, sym)
         working_spot = cash_spot if cash_spot is not None else fut_spot
         if cash_spot is None:
-            st.warning("Could not fetch Cash spot price from API. Falling back to Futures spot.")
-    elif spot_source == "Cash (estimate via parity)":
-        cash_spot = estimate_cash_spot_parity_consistent(df, fut_spot)
-        working_spot = cash_spot if cash_spot is not None else fut_spot
-        if cash_spot is None:
-            st.warning("Could not estimate Cash spot price. Falling back to Futures spot.")
+            st.warning("Cash spot unavailable for stock; using Futures spot.")
+    else:  # INDICES → honor dropdown
+        working_spot = fut_spot
+        if spot_source == "Cash (API)":
+            cash_spot = load_cash_spot_from_api(api_base, sym)
+            working_spot = cash_spot if cash_spot is not None else fut_spot
+            if cash_spot is None:
+                st.warning("Cash spot unavailable; using Futures spot.")
+        elif spot_source == "Cash (estimate via parity)":
+            cash_spot = estimate_cash_spot_parity_consistent(df, fut_spot)
+            working_spot = cash_spot if cash_spot is not None else fut_spot
+            if cash_spot is None:
+                st.warning("Parity estimate unavailable; using Futures spot.")
+
+    # Keep a short spot history (floats) for RV & diagnostics
+    if did_fetch and (working_spot is not None):
+        key = f"{sym}:{exp}"
+        buf = ss["spot_hist"].setdefault(key, [])
+        buf.append(float(working_spot))
+        if len(buf) > 360:
+            del buf[:len(buf) - 360]
 
     if df.empty:
         st.warning("No option rows returned by API for this selection.")
@@ -320,7 +373,8 @@ def render_app():
     st.title("Option Chain Dashboard")
     topL, topR = st.columns([3,1])
     with topL:
-        if source == "Live API" and "auto" in locals() and auto and seconds_to_next_tick is not None:
+        st.caption(f"Last fetched: {ts}")
+        if source == "Live API" and seconds_to_next_tick is not None:
             if cadence_mode.startswith("Market"):
                 st.caption(
                     f"Next market tick in ~{seconds_to_next_tick}s → "
@@ -332,19 +386,279 @@ def render_app():
                     f"Auto-fetch in ~{seconds_to_next_tick}s → "
                     f"at **{(now + timedelta(seconds=seconds_to_next_tick)).strftime('%H:%M:%S')} IST**"
                 )
-        st.caption(f"Last fetched: {ts}")
     with topR:
         st.metric("API hits (session)", ss.get("api_hits", 0))
 
-    # ---- Tabs ----
-    tab_overview, tab_runway, tab_money, tab_chain, tab_writing, tab_velocity, tab_movers, tab_iv, tab_diag = st.tabs(
-        ["Overview", "Gates & Runway", "Money Map", "Chain", "Writing", "Velocity", "Movers", "IV & Skew", "Diagnostics"]
+    # ---- Tabs (added 'Commentary') ----
+    tab_overview, tab_runway, tab_money, tab_chain, tab_writing, tab_velocity, tab_movers, tab_iv, tab_commentary, tab_diag = st.tabs(
+        ["Overview", "Gates & Runway", "Money Map", "Chain", "Writing", "Velocity", "Movers", "IV & Skew", "Commentary", "Diagnostics"]
     )
+
+    # --------------------------- Commentary (One-Glance + Narrative + AI JSON) ---------------------------
+    with tab_commentary:
+        st.subheader("One-Glance Commentary")
+    
+        # ---------- helpers ----------
+        def _isnum(x):
+            return isinstance(x, (int, float, np.floating)) and np.isfinite(x)
+    
+        def _fmt(x, n=2, suffix=""):
+            return f"{x:.{n}f}{suffix}" if _isnum(x) else "–"
+    
+        def _pct(x):
+            return f"{x*100:.0f}%" if _isnum(x) else "–"
+    
+        def _safe_mean(vs):
+            vs = [v for v in vs if _isnum(v)]
+            return float(np.mean(vs)) if vs else None
+    
+        # Direction score: 0 (mean revert) .. 100 (directional)
+        def _direction_score(regime, iv_z, vel_df, up_tbl, down_tbl, net_flow, pcr_ring):
+            score = 50.0
+    
+            # gamma regime
+            if isinstance(regime, str):
+                if "Short" in regime: score += 15
+                elif "Long" in regime: score -= 15
+    
+            # IV impulse
+            if _isnum(iv_z):
+                score += np.clip(abs(iv_z), 0, 4) * 6  # up to +24 on big impulse
+    
+            # runway pass ratios
+            def _pass_ratio(tbl):
+                if tbl is None or isinstance(tbl, (list, tuple)) or len(getattr(tbl, "columns", [])) == 0: 
+                    return None
+                return float(tbl["gate_ok"].mean()) if "gate_ok" in tbl.columns and len(tbl) else None
+            r_up, r_dn = _pass_ratio(up_tbl), _pass_ratio(down_tbl)
+            if _isnum(r_up) or _isnum(r_dn):
+                # favor the stronger side
+                d = (r_up or 0) - (r_dn or 0)
+                score += d * 20  # +/-20 tilt
+    
+            # velocity (net)
+            if vel_df is not None and not vel_df.empty and "velocity" in vel_df.columns:
+                v = float(vel_df["velocity"].sum())
+                score += np.tanh(v / 5_000) * 10  # soft clip
+    
+            # vega-weighted IV net flow (signed)
+            if _isnum(net_flow):
+                score += np.tanh(net_flow / 1e6) * 10
+    
+            # PCR tilt (extremes reduce trend score)
+            if _isnum(pcr_ring):
+                if pcr_ring > 1.4: score -= 6   # heavy put writing bias → reversion risk
+                if pcr_ring < 0.6: score -= 6   # heavy call writing bias → reversion risk
+    
+            return int(np.clip(score, 0, 100))
+    
+        # ---------- inputs & light recompute ----------
+        now2 = now_ist()
+        df_for_calc = df_ana if not df_ana.empty else df
+    
+        atm_iv_now = compute_atm_iv(df_for_calc, working_spot)
+        iv_hist = make_iv_skew_history(sym, exp, last_n=40)
+        iv_z = zscore_last(iv_hist["atm_iv"], window=20) if (iv_hist is not None and not iv_hist.empty and "atm_iv" in iv_hist) else None
+    
+        regime, gex_val = compute_gamma_regime(df_for_calc, working_spot, ring_size=fixed_skew_ring if fixed_skew_ring else 10)
+    
+        mstart, mend = market_bounds(now2)
+        minutes_left = max(1, (mend - now2).total_seconds() / 60.0) if mend else 60.0
+    
+        rails = compute_iv_rails(working_spot, atm_iv_now, minutes_left)
+        em = expected_move_nowcast(working_spot, atm_iv_now, minutes_left)
+    
+        r50 = rails.get(0.5) if isinstance(rails, dict) else None
+        breakout = breakout_probabilities(working_spot, r50, em["sigma_pts"]) if (r50 and em) else None
+    
+        gc = gex_curve(df_for_calc, working_spot)
+        probs, pin_k = (None, None)
+        if em and not gc.empty:
+            probs, pin_k = pin_probability(gc, working_spot, em["sigma_pts"])
+    
+        # runway quick calc (non-strict; small lookback)
+        _, vel_df = make_long_history(sym, exp, last_n=10)
+        up_tbl = down_tbl = None
+        if not df_ana.empty and working_spot is not None:
+            up_tbl, down_tbl, *_ = build_gate_runway_tables(
+                df_ring=df_ana, spot=working_spot, atm_idx_in_ring=atm_idx_ana, symbol=sym, expiry=exp,
+                up_n=6, down_n=6, lookback_frames=6, pass_threshold=0.85,
+            )
+    
+        frames = get_last_frames(sym, exp, n=2)
+        df_prev_for_flow = frames[-2] if len(frames) == 2 else None
+        flows, net_flow = compute_vega_weighted_iv_flow(df_for_calc, df_prev_for_flow)
+    
+        # money map + walls + wall-shift velocity
+        dfm = compute_money_map(df_for_calc)
+        wall_tbl = find_walls(dfm, z_thresh=1.5, k=4) if not dfm.empty else pd.DataFrame()
+        prev_walls = None
+        if len(frames) == 2:
+            prev_dfm = compute_money_map(frames[-2])
+            prev_walls = find_walls(prev_dfm, z_thresh=1.5, k=4)
+        wsv = wall_shift_velocity(wall_tbl, prev_walls, working_spot) if not wall_tbl.empty else None
+    
+        # liquidity pack
+        liq_stats = compute_spread_stats(df_for_calc, working_spot, band=3)
+        icp = impact_cost_proxy(df_for_calc, working_spot, qty=50)
+        liq_data = {}
+        if liq_stats and icp:
+            liq_data["median_spread_bps"] = liq_stats.get("median_spread_bps")
+            liq_data["ic_bps"] = icp.get("ic_bps")
+            liq_data["liquidity_stress"] = liquidity_stress(
+                liq_data["median_spread_bps"], liq_data["ic_bps"], dfm
+            )
+    
+        # sentiment / PCR
+        pcr_ring = compute_pcr(df_ana)
+        sentiment, _writing_text = get_writing_commentary(df_ana)
+    
+        # phase & direction score
+        minutes_since_open = (now2 - mstart).total_seconds() / 60.0 if mstart else None
+        pin_top = float(probs["pin_prob"].iloc[0]) if (probs is not None and not probs.empty and "pin_prob" in probs.columns) else None
+        phase = session_phase(minutes_since_open, iv_z, regime, pin_prob_top=pin_top)
+        dir_score = _direction_score(regime, iv_z, vel_df, up_tbl, down_tbl, net_flow, pcr_ring)
+    
+        # ---------- headline narrative ----------
+        gamma_label = "Long-gamma" if isinstance(regime, str) and "Long" in regime else ("Short-gamma" if isinstance(regime, str) and "Short" in regime else "Mixed")
+        if gamma_label == "Long-gamma":
+            st.markdown("**🟢 Long-gamma: mean-revert bias; prefer fade/credit structures.**")
+        elif gamma_label == "Short-gamma":
+            st.markdown("**🔴 Short-gamma: trend/breakout risk; prefer momentum/debit structures.**")
+        else:
+            st.markdown("**⚖️ Mixed gamma: stay tactical; let rails & IV guide.**")
+    
+        if _isnum(pin_top) and pin_k is not None:
+            st.markdown(f"🎯 **Pin risk** near **{int(pin_k)}** (top pin {_pct(pin_top)}).")
+    
+        # Mean-revert vs breakout label
+        if dir_score <= 40:
+            st.info("**Mean-revert bias ON** (score ≤40).")
+        elif dir_score >= 60:
+            st.warning("**Directional bias ON** (score ≥60).")
+        else:
+            st.caption("Neutral/transition — wait for alignment (rails + IV + velocity).")
+    
+        # ---------- One-glance metric rows ----------
+        a1, a2, a3 = st.columns([1.2, 1, 1])
+        with a1:
+            st.metric("Session phase", phase if phase else "–")
+            if em: st.metric("Expected move (1σ)", f"±{em['sigma_pts']:.0f} pts")
+            if r50: st.caption(f"Rails 50%: {int(r50[0])} ↔ {int(r50[1])}")
+        with a2:
+            st.metric("Gamma Regime", regime if isinstance(regime, str) else "–")
+            if breakout and "prob_up_break" in breakout:
+                st.metric("Breakout↑ (vs 50% rail)", _pct(breakout["prob_up_break"]))
+        with a3:
+            st.metric("Direction score", f"{dir_score}/100")
+            if probs is not None and pin_k is not None:
+                st.metric("Pin target", f"{int(pin_k)}")
+    
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            if not dfm.empty:
+                cm_p = money_center_of_mass(dfm, use_premium=True)
+                cm_o = money_center_of_mass(dfm, use_premium=False)
+                st.metric("Premium Center", f"{cm_p:.0f}" if _isnum(cm_p) else "–")
+                st.metric("OI Center", f"{cm_o:.0f}" if _isnum(cm_o) else "–")
+        with b2:
+            if _isnum(wsv):
+                st.metric("Wall-shift velocity", f"{wsv:+.0f} pts")
+            if _isnum(net_flow):
+                st.metric("Net IV Flow", f"{net_flow:,.0f}")
+        with b3:
+            if liq_data and _isnum(liq_data.get("median_spread_bps")):
+                st.metric("Median spread (bps)", f"{liq_data['median_spread_bps']:.0f}")
+            if liq_data and _isnum(liq_data.get("liquidity_stress")):
+                st.metric("Liquidity stress", f"{liq_data['liquidity_stress']*100:.0f} / 100")
+    
+        # ---------- Actionable bullets ----------
+        bullets = []
+        if "Short" in (regime or ""):
+            bullets.append("Short-gamma: **breakouts expand**; prefer directional/debit structures.")
+        elif "Long" in (regime or ""):
+            bullets.append("Long-gamma: **mean-revert**; prefer fade/credit structures.")
+        if _isnum(iv_z) and abs(iv_z) >= 2.0:
+            bullets.append(f"IV impulse z={iv_z:+.2f}: expect **larger range** than average.")
+        if _isnum(pin_top) and pin_top >= 0.35 and pin_k is not None:
+            bullets.append(f"High pin risk near **{int(pin_k)}** (**{_pct(pin_top)}**).")
+        if breakout and _isnum(breakout.get("prob_up_break")) and breakout["prob_up_break"] >= 0.55:
+            bullets.append("Upside breakout odds **>55%** vs 50% rail; look for **CE-unwind + PE-writing** on Runway.")
+        if _isnum(wsv) and wsv > 0:
+            bullets.append("Walls moving **toward** spot → compression/pin risk; **scalp edges**.")
+        if liq_data and _isnum(liq_data.get("median_spread_bps")) and liq_data["median_spread_bps"] > 120:
+            bullets.append("Wide spreads: **cut size** or wait for **liquidity pockets**.")
+        if dir_score >= 60: bullets.append("**Directional bias ON** (score ≥60).")
+        if dir_score <= 40: bullets.append("**Mean-revert bias ON** (score ≤40).")
+    
+        st.markdown("#### Actionable")
+        if bullets:
+            st.markdown("\n".join([f"- {b}" for b in bullets]))
+        else:
+            st.caption("Signals are mixed—be selective and wait for alignment (Runway + Velocity).")
+    
+        st.markdown("#### Invalidation / Flip")
+        st.markdown(
+            "- **Flip to trend** if 50% rail breaks **and** IV-z ≥ 2 **and** OI flow one-sided.\n"
+            "- **Flip back to fade** if pushes fail and IV cools while GEX pulls price back toward magnet.\n"
+        )
+    
+        # ---------- AI JSON payload (machine-readable) ----------
+        ai_payload = {
+            "meta": {
+                "symbol": sym, "expiry": exp, "timestamp": ts,
+                "instrument_kind": "stock" if sym in FNO_STOCKS else "index",
+                "source": "live" if isinstance(ts, str) and ":" in ts else "historical"
+            },
+            "prices": {
+                "working_spot": working_spot,
+                "futures_spot_from_oc": fut_spot,
+                "cash_spot_api": cash_spot
+            },
+            "iv": {
+                "atm_iv_percent": atm_iv_now,
+                "iv_zscore": iv_z,
+                "net_vega_weighted_iv_flow": net_flow
+            },
+            "gamma": {
+                "regime": regime,
+                "gex_total_relative": gex_val
+            },
+            "rails": {
+                "p50": list(map(float, r50)) if r50 else None,
+                "expected_move_sigma_points": em["sigma_pts"] if em else None,
+                "breakout_prob_up": breakout.get("prob_up_break") if breakout else None,
+                "breakout_prob_down": breakout.get("prob_dn_break") if breakout else None
+            },
+            "pinning": {
+                "pin_target_strike": int(pin_k) if pin_k is not None else None,
+                "pin_top_probability": float(pin_top) if _isnum(pin_top) else None
+            },
+            "oi_walls": {
+                "wall_shift_velocity_pts": wsv,
+                "premium_center": float(money_center_of_mass(dfm, use_premium=True)) if not dfm.empty else None,
+                "oi_center": float(money_center_of_mass(dfm, use_premium=False)) if not dfm.empty else None
+            },
+            "liquidity": {
+                "median_spread_bps": liq_data.get("median_spread_bps") if liq_data else None,
+                "impact_cost_bps": liq_data.get("ic_bps") if liq_data else None,
+                "liquidity_stress_0to1": liq_data.get("liquidity_stress") if liq_data else None
+            },
+            "sentiment": {
+                "pcr_ring": pcr_ring,
+                "writing_sentiment": sentiment
+            },
+            "scores": {
+                "direction_score_0to100": dir_score
+            }
+        }
+        with st.expander("Machine-readable Commentary (AI JSON)", expanded=False):
+            st.json(ai_payload)
 
     # --------------------------- Overview ---------------------------
     with tab_overview:
         st.subheader("Key Metrics")
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, _, _ = st.columns(5)
         c1.metric("Spot Used", f"{working_spot:,.2f}" if working_spot is not None else "–")
         if fut_spot is not None:
             c2.metric("Futures (OC spot)", f"{fut_spot:,.2f}")
@@ -389,9 +703,15 @@ def render_app():
             med_bps = liq_data.get("median_spread_bps")
             ic_bps = liq_data.get("ic_bps")
             stress = liq_data.get("liquidity_stress")
-            cL1.metric("Median spread (bps)", f"{med_bps:.0f}" if med_bps is not None and np.isfinite(med_bps) else "–")
-            cL2.metric("Impact proxy (bps)", f"{ic_bps:.0f}" if ic_bps is not None and np.isfinite(ic_bps) else "–")
-            cL3.metric("Liquidity stress", f"{(stress*100):.0f} / 100" if stress is not None else "–", help="Higher = harder fills")
+
+            cL1.metric("Median spread (bps)", f"{med_bps:.0f}" if _isnum(med_bps) else "–")
+            cL2.metric("Impact proxy (bps)", f"{ic_bps:.0f}" if _isnum(ic_bps) else "–")
+            cL3.metric(
+                "Liquidity stress",
+                f"{(stress * 100):.0f} / 100" if _isnum(stress) else "–",
+                help="Higher = harder fills"
+            )
+
 
         st.markdown("---")
 
@@ -405,8 +725,18 @@ def render_app():
         minutes_left = max(1, (mend - now).total_seconds() / 60.0)
         rails = compute_iv_rails(working_spot, atm_iv_now, minutes_left)
 
-        sup_zones, res_zones = summarize_zones(df_ana, top_n=2)
+        # Expected move (to close)
+        em = expected_move_nowcast(working_spot, atm_iv_now, minutes_left)
+        if em:
+            st.metric("Expected move (1σ)", f"±{em['sigma_pts']:.0f} pts")
+            c = em["cones"]
+            st.caption(
+                f"Cones → 25%: {c[0.25][0]:.0f} ↔ {c[0.25][1]:.0f} | "
+                f"50%: {c[0.50][0]:.0f} ↔ {c[0.50][1]:.0f} | "
+                f"75%: {c[0.75][0]:.0f} ↔ {c[0.75][1]:.0f}"
+            )
 
+        sup_zones, res_zones = summarize_zones(df_ana, top_n=2)
         sev, qtext = make_quick_execution_commentary(
             liq=liq_data, iv_z=iv_z, gamma_regime=regime, pcr=pcr_window, rails=rails,
             sup_zones=sup_zones, res_zones=res_zones,
@@ -442,7 +772,7 @@ def render_app():
         else:
             st.caption("Momentum: waiting for velocity data (needs ≥2 snapshots).")
 
-        # Gamma regime metric + GEX curve
+        # Gamma regime metric + GEX curve + pins
         regime_emoji = "🟢" if "Long" in regime else ("🔴" if "Short" in regime else "❓")
         st.metric("Gamma Regime", f"{regime_emoji} {regime}", help=f"GEX={gex_val:,.0f}")
         gc = gex_curve(df_ana if not df_ana.empty else df, working_spot)
@@ -457,16 +787,22 @@ def render_app():
             k_mag = gc.iloc[gc["gex"].rank(pct=True).idxmax()]["strike"]
             st.caption(f"Likely pin/magnet region near **{int(k_mag)}** (largest GEX).")
 
-        # Rails
-        if rails:
-            r50 = rails.get(0.5)
-            if r50:
-                st.metric("IV Rails (50%)", f"{r50[0]:.0f} ↔ {r50[1]:.0f}")
-                all_zones = (sup_zones or []) + (res_zones or [])
-                if all_zones and working_spot is not None:
-                    nz = min(all_zones, key=lambda k: abs(k - working_spot))
-                    inside = (r50[0] <= nz <= r50[1])
-                    st.caption(f"{'🎯' if inside else '🚧'} Nearest zone {int(nz)} is {'inside' if inside else 'outside'} the 50% cone.")
+        # Rails + breakout odds
+        if rails and rails.get(0.5):
+            r50 = rails[0.5]
+            st.metric("IV Rails (50%)", f"{r50[0]:.0f} ↔ {r50[1]:.0f}")
+            all_zones = (sup_zones or []) + (res_zones or [])
+            if all_zones and working_spot is not None:
+                nz = min(all_zones, key=lambda k: abs(k - working_spot))
+                inside = (r50[0] <= nz <= r50[1])
+                st.caption(f"{'🎯' if inside else '🚧'} Nearest zone {int(nz)} is {'inside' if inside else 'outside'} the 50% cone.")
+
+            if em:
+                bp = breakout_probabilities(working_spot, r50, em["sigma_pts"])
+                if bp:
+                    cA, cB = st.columns(2)
+                    cA.metric("Breakout↑ prob (vs 50% rail)", f"{bp['prob_up_break']*100:.0f}%")
+                    cB.metric("Breakout↓ prob (vs 50% rail)", f"{bp['prob_dn_break']*100:.0f}%")
 
         event = detect_stop_hunt(sym, exp)
         if event:
@@ -608,6 +944,20 @@ def render_app():
             wall_tbl = find_walls(dfm, z_thresh=1.5, k=4)
             c3.metric("Walls flagged", f"{len(wall_tbl)}")
 
+            # Wall-shift velocity vs previous ring snapshot
+            prev_walls = None
+            frames_mm = get_last_frames(sym, exp, n=2)
+            if len(frames_mm) == 2:
+                prev_dfm = compute_money_map(frames_mm[-2])
+                prev_walls = find_walls(prev_dfm, z_thresh=1.5, k=4)
+            wsv = wall_shift_velocity(wall_tbl, prev_walls, working_spot) if not wall_tbl.empty else None
+            if wsv is not None:
+                st.metric(
+                    "Wall-shift velocity",
+                    f"{wsv:+.0f} pts",
+                    help=">0 = walls moving toward spot (compression/pin risk); <0 = release/room to run."
+                )
+
             left, right = st.columns(2)
             with left:
                 if "prem_stock" in dfm.columns:
@@ -692,7 +1042,6 @@ def render_app():
     # ---------------------------- Velocity ----------------------------
     with tab_velocity:
         st.subheader("Net OI Change Velocity (Intraday)")
-        # Research mode removed → only Live (last N)
         colv1, colv2 = st.columns([2,1])
         with colv2:
             last_n = st.number_input("Last N snapshots", 5, 240, 40, 5)
@@ -740,10 +1089,13 @@ def render_app():
         else:
             st.info("Velocity will appear after two or more snapshots are captured.")
 
-    # ----------------------------- Movers -----------------------------
+    # ----------------------------- Movers (FIXED) -----------------------------
     with tab_movers:
-        st.subheader("Top Movers & Analytics (window)")
-        ce_ch, pe_ch, ce_oi, pe_oi, ch_df, oi_df, net_df = build_movers_long(dfw, n=5)
+        st.subheader("Top Movers & Analytics")
+        # FIX: use the **full chain** so we always have enough rows/metrics
+        base_df = df if not df.empty else dfw
+        ce_ch, pe_ch, ce_oi, pe_oi, ch_df, oi_df, net_df = build_movers_long(base_df, n=5)
+
         colA, colB = st.columns(2)
         with colA:
             st.markdown("**OI Change (Top 5)**")
@@ -755,15 +1107,20 @@ def render_app():
             ch2 = movers_chart(oi_df, "Open Interest")
             if ch2 is not None: st.altair_chart(ch2, use_container_width=True)
             else: st.info("No OI data.")
+
         cL, cR = st.columns(2)
         with cL:
             st.markdown("#### CE Movers")
-            st.dataframe(style_mover_table(ce_ch, "CE_oi_change"), use_container_width=True)
-            st.dataframe(style_mover_table(ce_oi, "CE_oi"), use_container_width=True)
+            if ce_ch is not None: st.dataframe(style_mover_table(ce_ch, "CE_oi_change"), use_container_width=True)
+            if ce_oi is not None: st.dataframe(style_mover_table(ce_oi, "CE_oi"), use_container_width=True)
         with cR:
             st.markdown("#### PE Movers")
-            st.dataframe(style_mover_table(pe_ch, "PE_oi_change"), use_container_width=True)
-            st.dataframe(style_mover_table(pe_oi, "PE_oi"), use_container_width=True)
+            if pe_ch is not None: st.dataframe(style_mover_table(pe_ch, "PE_oi_change"), use_container_width=True)
+            if pe_oi is not None: st.dataframe(style_mover_table(pe_oi, "PE_oi"), use_container_width=True)
+
+        if net_df is not None and not net_df.empty:
+            st.markdown("#### Net OI Change (PE−CE): Top 5 by magnitude")
+            st.dataframe(net_df, use_container_width=True, hide_index=True)
 
     # ---------------------------- IV & Skew ----------------------------
     with tab_iv:
@@ -852,6 +1209,156 @@ def render_app():
             )
             st.altair_chart(chart, use_container_width=True)
         st.caption("Flow proxy: vega × OI × ΔIV per side & strike; aggregated over your analytics ring.")
+# --------------------------- Commentary (AI payload + emoji) ---------------------------
+    with tab_commentary:
+        st.subheader("Commentary (AI payload + quick glance)")
+    
+        # Cash OHLC (for day range + LTP)
+        cash_ohlc = _fetch_cash_ohlc(api_base, sym, inst)  # {"open","high","low","ltp"} or None
+        fut_ohlc = None  # optional, set if you later add a futures OHLC endpoint
+    
+        # Recompute a few things we need (cheap ops)
+        df_for_calc = df_ana if not df_ana.empty else df
+        atm_iv_now = compute_atm_iv(df_for_calc, working_spot)
+        iv_hist = make_iv_skew_history(sym, exp, last_n=40)
+        iv_z = zscore_last(iv_hist["atm_iv"], window=20) if not iv_hist.empty else None
+        mstart, mend = market_bounds(now)
+        minutes_left = max(1, (mend - now).total_seconds() / 60.0) if mend else 60
+        rails = compute_iv_rails(working_spot, atm_iv_now, minutes_left)
+        regime, _gex = compute_gamma_regime(df_for_calc, working_spot, ring_size=fixed_skew_ring)
+    
+        # Expected move + breakout
+        em = expected_move_nowcast(working_spot, atm_iv_now, minutes_left)
+        breakout_probs_dict = breakout_probabilities(
+            working_spot, rails.get(0.50) if rails else None, (em or {}).get("sigma_pts")
+        ) if rails and em else None
+    
+        # GEX + pin probs
+        gc = gex_curve(df_for_calc, working_spot)
+        pin_table_list = []
+        if not gc.empty and em:
+            probs_df, pin_k = pin_probability(gc, working_spot, em["sigma_pts"])
+            if probs_df is not None and not probs_df.empty:
+                pin_table_list = [{"strike": float(r.strike), "prob": float(r.pin_prob)} for _, r in probs_df.head(5).iterrows()]
+    
+        # Supports / resistances summary
+        sup_zones, res_zones = summarize_zones(df_for_calc, top_n=2)
+        supports = sup_zones or []
+        resistances = res_zones or []
+    
+        # Money map, walls, wall-shift velocity (vs previous ring)
+        dfm = compute_money_map(df_for_calc)
+        walls_tbl = find_walls(dfm, z_thresh=1.5, k=4) if not dfm.empty else pd.DataFrame()
+        walls_list = []
+        if not walls_tbl.empty:
+            for _, r in walls_tbl.iterrows():
+                walls_list.append({"strike": float(r["strike"]), "z": float(r["wall_z"]), "type": "support" if r.get("type","support")=="support" else "resistance"})
+        prev_frames = get_last_frames(sym, exp, n=2)
+        prev_walls_tbl = pd.DataFrame()
+        if len(prev_frames) == 2:
+            prev_dfm = compute_money_map(prev_frames[-2])
+            prev_walls_tbl = find_walls(prev_dfm, z_thresh=1.5, k=4) if not prev_dfm.empty else pd.DataFrame()
+        wsv = wall_shift_velocity(walls_tbl, prev_walls_tbl, working_spot) if not walls_tbl.empty else None
+    
+        premium_center = money_center_of_mass(dfm, use_premium=True) if not dfm.empty else None
+        oi_center = money_center_of_mass(dfm, use_premium=False) if not dfm.empty else None
+        top_prem_stock = []
+        top_prem_new = []
+        if not dfm.empty:
+            if "prem_stock" in dfm.columns:
+                top_prem_stock = dfm.nlargest(3, "prem_stock")[["strike","prem_stock"]].assign(value=lambda x:x["prem_stock"]).drop(columns=["prem_stock"]).to_dict("records")
+            if "prem_new" in dfm.columns:
+                top_prem_new = dfm.nlargest(3, "prem_new")[["strike","prem_new"]].assign(value=lambda x:x["prem_new"]).drop(columns=["prem_new"]).to_dict("records")
+    
+        # Momentum/velocity (last N)
+        _, vel_df_local = make_long_history(sym, exp, last_n=10)
+        vel_up_sum = float(vel_df_local[vel_df_local["velocity"]>0]["velocity"].sum()) if not vel_df_local.empty else 0.0
+        vel_dn_sum = float(-vel_df_local[vel_df_local["velocity"]<0]["velocity"].sum()) if not vel_df_local.empty else 0.0
+        vel_tilt = (vel_up_sum - vel_dn_sum) / max(1e-9, (vel_up_sum + vel_dn_sum)) if (vel_up_sum + vel_dn_sum) > 0 else 0.0
+        spikes_tbl = velocity_spike_table(vel_df_local, k=5, threshold=None) if not vel_df_local.empty else pd.DataFrame()
+        vel_spikes = [{"strike": float(r["strike"]), "abs_value": float(abs(r["velocity"])), "side": "PE" if r["velocity"]>0 else "CE"} for _, r in spikes_tbl.iterrows()] if not spikes_tbl.empty else []
+    
+        # IV flow
+        frames2 = get_last_frames(sym, exp, n=2)
+        df_prev_for_flow = frames2[-2] if len(frames2) == 2 else None
+        flows, net_flow = compute_vega_weighted_iv_flow(df_for_calc, df_prev_for_flow)
+        iv_top_flows = []
+        if not flows.empty:
+            flows_plot = flows.assign(abs_flow=lambda x: x["flow"].abs()).nlargest(5, "abs_flow")
+            iv_top_flows = [{"strike": float(r["strike"]), "side": r["side"], "flow": float(r["flow"])} for _, r in flows_plot.iterrows()]
+    
+        # Liquidity pack
+        liq_stats = compute_spread_stats(df_for_calc, working_spot, band=3)
+        icp = impact_cost_proxy(df_for_calc, working_spot, qty=50)
+        median_spread_bps = liq_stats.get("median_spread_bps") if liq_stats else None
+        impact_bps_50qty = icp.get("ic_bps") if icp else None
+        liq_stress = liquidity_stress(median_spread_bps, impact_bps_50qty, dfm) if (median_spread_bps and impact_bps_50qty and not dfm.empty) else None
+    
+        # Realized vol gap
+        buf = st.session_state.get("spot_hist", {}).get(f"{sym}:{exp}")
+        rv = realized_vol_annualized(list(buf)) if buf else None
+        iv_minus_rv = (atm_iv_now - rv) if (atm_iv_now is not None and rv is not None) else None
+    
+        # meta & clock
+        minutes_since_open = (now - mstart).total_seconds()/60.0 if mstart else None
+        minutes_to_close = (mend - now).total_seconds()/60.0 if mend else None
+    
+        # pin probability top (for phase)
+        pin_top = (pin_table_list[0]["prob"] if pin_table_list else None)
+        phase = session_phase(minutes_since_open, iv_z, regime, pin_prob_top=pin_top)
+    
+        meta = {
+            "symbol": sym, "instrument": inst.upper(), "expiry": exp,
+            "timestamp": ts, "source": source, "dte_days": None, "session_phase": phase
+        }
+        market_clock = {"minutes_since_open": minutes_since_open, "minutes_to_close": minutes_to_close}
+    
+        # Build payload (first pass)
+        payload = _build_commentary_json_v2(
+            meta=meta, market_clock=market_clock,
+            working_spot=working_spot, basis=(fut_spot - cash_spot) if (cash_spot is not None and fut_spot is not None) else None,
+            cash_ohlc=cash_ohlc, fut_ohlc=fut_ohlc,
+            atm_strike=float(df.iloc[atm_idx]["strike"]) if len(df) else None,
+            supports=[float(x) for x in (supports or [])],
+            resistances=[float(x) for x in (resistances or [])],
+            max_pain=float(compute_max_pain(df_for_calc)) if compute_max_pain(df_for_calc) is not None else None,
+            gex_pin=None,
+            atm_iv=atm_iv_now, iv_z=iv_z, rr25=(compute_rr_bf(df_for_calc)[0]), bf25=(compute_rr_bf(df_for_calc)[1]),
+            iv_minus_rv=iv_minus_rv,
+            expected_move=em, rails=rails, gamma_regime=regime, breakout_probs=breakout_probs_dict,
+            pcr_ring=pcr_window, pcr_full=pcr_full, pin_table=pin_table_list,
+            premium_center=premium_center, oi_center=oi_center, walls=walls_list,
+            wall_shift_velocity_pts=wsv,
+            top_prem_stock=top_prem_stock, top_prem_new=top_prem_new,
+            vel_up_sum=vel_up_sum, vel_dn_sum=vel_dn_sum, vel_tilt=vel_tilt, vel_spikes=vel_spikes,
+            iv_net_flow=net_flow, iv_top_flows=iv_top_flows,
+            median_spread_bps=median_spread_bps, impact_bps_50qty=impact_bps_50qty, liq_stress=liq_stress,
+            direction_score=None, bias=None, tags=None,
+            decision=None, data_quality={"missing": []}
+        )
+    
+        # Tags + decision + scores
+        score, bias, tags, decision = _auto_tags_and_decision(payload)
+        payload["derived"]["direction_score_0_100"] = score
+        payload["derived"]["bias"] = bias
+        payload["derived"]["tags"] = tags
+        payload["decision"] = decision
+    
+        # Human glance (emoji)
+        st.markdown("#### Quick glance")
+        st.text(_emoji_summary(payload))
+    
+        # JSON pretty + download
+        st.markdown("#### AI payload (JSON v2)")
+        pretty = json.dumps(payload, indent=2, ensure_ascii=False)
+        st.code(pretty, language="json")
+        st.download_button(
+            "Download commentary.json",
+            data=pretty.encode("utf-8"),
+            file_name=f"commentary_{sym}_{exp}_{ts.replace(':','-')}.json",
+            mime="application/json",
+            use_container_width=True
+        )
 
     # --------------------------- Diagnostics ---------------------------
     with tab_diag:
@@ -875,6 +1382,275 @@ def render_app():
         present_cols = [c for c in ["CE_iv","PE_iv","CE_delta","PE_delta","CE_oi_change","PE_oi_change","CE_oi","PE_oi"] if c in df.columns]
         st.write({"present_columns": present_cols})
 
+# ---------- Commentary helpers (OHLC + payload + tags) ----------
+
+_INDEX_NAME_MAP = {
+    "NIFTY": "NIFTY 50",
+    "NIFTY 50": "NIFTY 50",
+    "NIFTY-I": "NIFTY 50",
+    "BANKNIFTY": "NIFTY BANK",
+    "NIFTY BANK": "NIFTY BANK",
+    "BANKNIFTY-I": "NIFTY BANK",
+}
+
+@st.cache_data(show_spinner=False, ttl=10)
+def _fetch_cash_ohlc(api_base: str, symbol: str, instrument: str):
+    """
+    Returns dict with lower-case keys: {"open","high","low","ltp"} or None.
+    Uses your local endpoints:
+      - Index:  GET {api_base}/nse/index/ohlc?symbols=NIFTY 50
+      - Stock:  GET {api_base}/nse/stocks/ohlc?symbols=RELIANCE
+    """
+    try:
+        if instrument.upper() == "INDEX":
+            human = _INDEX_NAME_MAP.get(symbol.upper(), symbol)
+            url = f"{api_base}/nse/index/ohlc"
+            params = {"symbols": human}
+        else:
+            url = f"{api_base}/nse/stocks/ohlc"
+            params = {"symbols": symbol.upper()}
+        r = requests.get(url, params=params, timeout=2.5)
+        if r.status_code != 200:
+            return None
+        js = r.json() or {}
+        # Normalize to lower-case keys the app expects
+        out = {
+            "open": float(js.get("Open")) if js.get("Open") is not None else None,
+            "high": float(js.get("High")) if js.get("High") is not None else None,
+            "low":  float(js.get("Low"))  if js.get("Low")  is not None else None,
+            "ltp":  float(js.get("LTP"))  if js.get("LTP")  is not None else None,
+        }
+        return out
+    except Exception:
+        return None
+
+def _day_range_position(cash_ohlc: dict, working_spot: float):
+    try:
+        lo, hi = float(cash_ohlc["low"]), float(cash_ohlc["high"])
+        if hi > lo and working_spot is not None:
+            return max(0.0, min(1.0, (float(working_spot) - lo) / (hi - lo)))
+    except Exception:
+        pass
+    return None
+
+def _build_commentary_json_v2(
+    *,
+    meta, market_clock,           # dicts
+    working_spot, basis,          # floats/None
+    cash_ohlc=None, fut_ohlc=None,
+    atm_strike=None, supports=None, resistances=None, max_pain=None, gex_pin=None,
+    atm_iv=None, iv_z=None, rr25=None, bf25=None, iv_minus_rv=None,
+    expected_move=None, rails=None, gamma_regime="Neutral", breakout_probs=None,
+    pcr_ring=None, pcr_full=None, pin_table=None,
+    premium_center=None, oi_center=None, walls=None, wall_shift_velocity_pts=None,
+    top_prem_stock=None, top_prem_new=None,
+    vel_up_sum=None, vel_dn_sum=None, vel_tilt=None, vel_spikes=None,
+    iv_net_flow=None, iv_top_flows=None,
+    median_spread_bps=None, impact_bps_50qty=None, liq_stress=None,
+    direction_score=None, bias=None, tags=None,
+    decision=None, data_quality=None
+):
+    return {
+        "meta": meta,
+        "market_clock": market_clock,
+        "price": {
+            "working_spot": working_spot,
+            "basis": basis,
+            "day_range_position": _day_range_position(cash_ohlc or {}, working_spot),
+            "cash_ohlc": cash_ohlc,
+            "fut_ohlc": fut_ohlc,
+        },
+        "strikes": {
+            "atm_strike": atm_strike,
+            "supports": supports or [],
+            "resistances": resistances or [],
+            "max_pain": max_pain,
+            "gex_pin_strike": gex_pin,
+        },
+        "volatility": {
+            "atm_iv": atm_iv, "iv_z": iv_z, "rr25": rr25, "bf25": bf25, "iv_minus_rv": iv_minus_rv,
+            "expected_move_pts_1sigma": (expected_move or {}).get("sigma_pts") if expected_move else None,
+            "cones": (expected_move or {}).get("cones") if expected_move else None
+        },
+        "rails": {
+            "gamma_regime": gamma_regime,
+            "p25": (rails or {}).get(0.25) if rails else None,
+            "p50": (rails or {}).get(0.50) if rails else None,
+            "p75": (rails or {}).get(0.75) if rails else None,
+            "breakout_prob_vs_p50": breakout_probs or None
+        },
+        "positioning": {
+            "pcr_ring": pcr_ring, "pcr_full": pcr_full,
+            "pin_probabilities": pin_table or []
+        },
+        "money_map": {
+            "premium_center": premium_center, "oi_center": oi_center,
+            "walls": walls or [], "wall_shift_velocity_pts": wall_shift_velocity_pts,
+            "top_premium_stock": top_prem_stock or [], "top_premium_new": top_prem_new or []
+        },
+        "momentum": {
+            "velocity_up_sum": vel_up_sum, "velocity_down_sum": vel_dn_sum,
+            "velocity_tilt": vel_tilt, "velocity_spikes": vel_spikes or []
+        },
+        "iv_flow": { "net_flow": iv_net_flow, "top_flows": iv_top_flows or [] },
+        "liquidity": {
+            "median_spread_bps": median_spread_bps,
+            "impact_bps_50qty": impact_bps_50qty,
+            "stress": liq_stress
+        },
+        "derived": {
+            "direction_score_0_100": direction_score,
+            "bias": bias,
+            "tags": tags or []
+        },
+        "decision": decision or {},
+        "data_quality": data_quality or {"missing": []}
+    }
+
+def _auto_tags_and_decision(payload: dict):
+    """Lightweight rules → tags, direction score, suggestion."""
+    tags = []
+    dr = payload["rails"]
+    mm = payload["money_map"]
+    pos = payload["positioning"]
+    vol = payload["volatility"]
+    mom = payload["momentum"]
+    liq = payload["liquidity"]
+
+    # regime
+    g = (dr.get("gamma_regime") or "Neutral").lower().replace(" ", "_")
+    if "long" in g: tags.append("long_gamma")
+    elif "short" in g: tags.append("short_gamma")
+    else: tags.append("gamma_neutral")
+
+    # rails/location
+    p50 = dr.get("p50")
+    spot = payload["price"]["working_spot"]
+    if p50 and spot is not None:
+        inside = (p50[0] <= spot <= p50[1])
+        tags.append("rails_inside" if inside else "rails_outside_run")
+
+    # pin risk
+    pins = pos.get("pin_probabilities") or []
+    if pins and pins[0].get("prob", 0) >= 0.3:
+        tags.append("pin_risk_high")
+    else:
+        tags.append("pin_risk_low")
+
+    # breakout probs
+    bp = dr.get("breakout_prob_vs_p50") or {}
+    up_p, dn_p = bp.get("up", 0.0), bp.get("down", 0.0)
+    if max(up_p, dn_p) >= 0.55:
+        tags.append("breakout_prob_up_high" if up_p > dn_p else "breakout_prob_down_high")
+    else:
+        tags.append("breakout_prob_balanced")
+
+    # PCR
+    pcr = pos.get("pcr_ring")
+    if pcr is not None:
+        if pcr <= 0.9: tags.append("pcr_bullish")
+        elif pcr >= 1.1: tags.append("pcr_bearish")
+        else: tags.append("pcr_neutral")
+
+    # vol impulse / pricing
+    iv_z = vol.get("iv_z")
+    if iv_z is not None and abs(iv_z) >= 2.0:
+        tags.append("iv_impulse_up" if iv_z > 0 else "iv_impulse_down")
+    iv_minus_rv = vol.get("iv_minus_rv")
+    if iv_minus_rv is not None:
+        tags.append("options_rich_vs_rv" if iv_minus_rv > 0 else "options_cheap_vs_rv")
+
+    # momentum tilt
+    tilt = (mom.get("velocity_tilt") or 0.0)
+    if tilt >= 0.15: tags.append("velocity_solid_up")
+    elif tilt <= -0.15: tags.append("velocity_solid_down")
+    elif tilt > 0: tags.append("velocity_slight_up")
+    elif tilt < 0: tags.append("velocity_slight_down")
+
+    # liquidity
+    stress = liq.get("stress")
+    if stress is not None:
+        tags.append("liquidity_ok" if stress <= 0.5 else "liquidity_stressed")
+
+    # basis
+    basis = payload["price"].get("basis")
+    if basis is not None:
+        tags.append("basis_positive" if basis > 0 else "basis_negative")
+
+    # direction score (0-100): rails & tilt & breakout
+    score = 50
+    score += 15 * tilt
+    score += 20 * (up_p - dn_p)
+    if "long_gamma" in tags and "rails_inside" in tags:
+        score -= 10
+    if "pcr_bullish" in tags: score += 5
+    if "pcr_bearish" in tags: score -= 5
+    score = max(0, min(100, round(score)))
+
+    # bias & suggestion
+    if "long_gamma" in tags and "rails_inside" in tags and abs(tilt) < 0.08:
+        bias = "Mean-Revert"
+        suggestion = "credit_condor"
+    else:
+        if score >= 58 and up_p > dn_p:
+            bias = "Trend Up"
+            suggestion = "debit_call_spread"
+        elif score >= 58 and dn_p > up_p:
+            bias = "Trend Down"
+            suggestion = "debit_put_spread"
+        else:
+            bias = "Range / Fade"
+            suggestion = "iron_fly"
+
+    decision = {
+        "suggestion": suggestion,
+        "confidence_0_1": round(min(0.95, 0.45 + abs(score - 50) / 100), 2),
+        "reasons": [t for t in tags if t.startswith("breakout_") or "gamma" in t or "rails" in t][:3],
+        "levels": {}
+    }
+    return score, bias, tags, decision
+
+def _emoji_summary(payload: dict) -> str:
+    # line 1
+    ds = payload["derived"].get("direction_score_0_100")
+    phase = payload["meta"].get("session_phase")
+    L1 = f"🧭 {phase} · {ds}/100"
+
+    # line 2
+    em = payload["volatility"].get("expected_move_pts_1sigma")
+    p50 = payload["rails"].get("p50")
+    if em and p50:
+        L2 = f"🎯 ±{em:.0f} | p50: {p50[0]:.0f} ↔ {p50[1]:.0f}"
+    elif em:
+        L2 = f"🎯 ±{em:.0f}"
+    else:
+        L2 = "🎯 —"
+
+    # line 3
+    pins = payload["positioning"].get("pin_probabilities") or []
+    pin_txt = f"{int(pins[0]['strike'])} ({pins[0]['prob']*100:.0f}%)" if pins else "—"
+    walls = payload["money_map"].get("walls") or []
+    sup = next((int(w["strike"]) for w in walls if w.get("type")=="support"), None)
+    res = next((int(w["strike"]) for w in walls if w.get("type")=="resistance"), None)
+    wsv = payload["money_map"].get("wall_shift_velocity_pts")
+    walls_txt = f"{sup or '—'} / {res or '—'}"
+    L3 = f"📌 {pin_txt} | 🧱 {walls_txt} ({wsv:+.0f}→)" if wsv is not None else f"📌 {pin_txt} | 🧱 {walls_txt}"
+
+    # line 4
+    nf = payload["iv_flow"].get("net_flow")
+    tilt = payload["momentum"].get("velocity_tilt")
+    L4 = f"🌊 IV net {nf:,.0f} ; 💨 tilt {tilt:+.02f}" if nf is not None and tilt is not None else "🌊 —"
+
+    # line 5
+    sp = payload["liquidity"].get("median_spread_bps")
+    st = payload["liquidity"].get("stress")
+    L5 = f"💧 {sp:.0f}bps | stress {st:.2f}" if sp is not None and st is not None else "💧 —"
+
+    # line 6
+    dec = payload.get("decision") or {}
+    L6 = f"🛠️ {dec.get('suggestion','—')} ({(dec.get('confidence_0_1') or 0)*100:.0f}%)"
+
+    return "\n".join([L1, L2, L3, L4, L5, L6])
 
 # Streamlit entrypoint
 if __name__ == "__main__":

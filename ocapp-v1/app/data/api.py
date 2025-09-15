@@ -9,6 +9,7 @@ from urllib3.util.retry import Retry
 
 from config import (
     NIFTY_EXPIRIES_FALLBACK, BANKNIFTY_EXPIRIES_FALLBACK,
+    FNO_STOCKS,
 )
 from utils.common import to_float
 from config import IST, now_ist
@@ -92,10 +93,14 @@ def load_snapshot_from_hist_api(api_base: str, symbol: str, expiry: str, date: s
         return None
 
 # ======================================================
-# Unified "truth of spot": prefer local Index OHLC LTP
+# Unified "truth of spot": prefer local OHLC LTPs
+#   - Indices  -> /nse/index/ohlc   (LTP)
+#   - Stocks   -> /nse/stocks/ohlc  (LTP)
+#   - Fallback -> {api_base}/spot   (legacy)
 # ======================================================
 
 _INDEX_OHLC_URL = "http://localhost:8000/nse/index/ohlc"
+_STOCK_OHLC_URL = "http://localhost:8000/nse/stocks/ohlc"
 
 # Accept the usual variants you use across the app
 _INDEX_NAME_MAP = {
@@ -114,11 +119,26 @@ def _symbol_to_index_name(symbol: str) -> Optional[str]:
     k = symbol.strip().upper().replace("_", " ")
     return _INDEX_NAME_MAP.get(k)
 
-# Keep a tiny cache so Streamlit reruns don't spam your local service.
+# Tiny caches so Streamlit reruns don't spam your local services.
 @st.cache_data(show_spinner=False, ttl=1.0)
 def _load_index_spot_from_local_api(index_human_name: str) -> Optional[float]:
     try:
         r = get_http().get(_INDEX_OHLC_URL, params={"symbols": index_human_name}, timeout=2.5)
+        if r.status_code != 200:
+            return None
+        data = r.json()  # {"High":..,"LTP":..,"Low":..,"Open":..}
+        v = to_float(data.get("LTP"))
+        if v is None or not np.isfinite(v) or not (1 <= v < 1e7):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+@st.cache_data(show_spinner=False, ttl=1.0)
+def _load_stock_spot_from_local_api(stock_symbol: str) -> Optional[float]:
+    try:
+        # requests will URL-encode special tickers like "M&M", "MCDOWELL-N", etc.
+        r = get_http().get(_STOCK_OHLC_URL, params={"symbols": stock_symbol}, timeout=2.5)
         if r.status_code != 200:
             return None
         data = r.json()  # {"High":..,"LTP":..,"Low":..,"Open":..}
@@ -143,15 +163,27 @@ def _legacy_spot(api_base: str, symbol: str) -> Optional[float]:
 
 def load_cash_spot_from_api(api_base: str, symbol: str) -> Optional[float]:
     """
-    For index symbols, return cash index LTP from local OHLC.
-    Otherwise (or on failure), return the legacy REST spot.
+    Unified 'truth of spot':
+      - Index symbols -> local Index OHLC LTP
+      - Stock symbols -> local Stocks OHLC LTP
+      - Fallback      -> legacy {api_base}/spot
     Signature unchanged.
     """
+    # Index path
     idx = _symbol_to_index_name(symbol)
     if idx:
         v = _load_index_spot_from_local_api(idx)
         if v is not None:
             return v
+
+    # Stock path
+    sym_up = (symbol or "").strip().upper()
+    if sym_up in FNO_STOCKS:
+        v = _load_stock_spot_from_local_api(sym_up)
+        if v is not None:
+            return v
+
+    # Fallback to legacy REST spot
     return _legacy_spot(api_base, symbol)
 
 # =========================
