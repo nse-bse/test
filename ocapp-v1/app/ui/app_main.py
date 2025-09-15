@@ -41,7 +41,11 @@ from features.money_map import (
 from features.liquidity import (
     compute_spread_stats, impact_cost_proxy, liquidity_stress, gex_curve,
     realized_vol_annualized, pcr_vol, make_quick_execution_commentary,
+    liquidity_stress_v2, estimate_rupee_impact, plan_order_sizes, rank_strikes_by_edge_pressure,
+    find_execution_windows, 
 )
+from features.liquidity import liquidity_stress_with_stats
+
 from features.runway import (
     build_gate_runway_tables, apply_runway_enhancements, confidence_score,
 )
@@ -151,6 +155,7 @@ def render_app():
     ss.setdefault("hist_time_pending", "15:30")
     ss.setdefault("hist_sel_key", None)
     ss.setdefault("current_source", None)
+    ss.setdefault("liq_hist", {})   # { "SYM:EXP": [stress0..n] }  (floats 0..1)
 
     # ---- sidebar: source & symbol ----
     st.sidebar.header("Data Source & Symbol")
@@ -202,7 +207,7 @@ def render_app():
 
     # Heartbeat (rerun)
     if st_autorefresh:
-        hb = st_autorefresh(interval=40000, key="heartbeat")
+        hb = st_autorefresh(interval=60000, key="heartbeat")
         st.sidebar.caption(f"🫀 heartbeat #{hb}")
     else:
         st.sidebar.warning("`streamlit-autorefresh` not installed → no timed re-runs.")
@@ -505,9 +510,20 @@ def render_app():
         if liq_stats and icp:
             liq_data["median_spread_bps"] = liq_stats.get("median_spread_bps")
             liq_data["ic_bps"] = icp.get("ic_bps")
-            liq_data["liquidity_stress"] = liquidity_stress(
-                liq_data["median_spread_bps"], liq_data["ic_bps"], dfm
+            ring_df = compute_money_map(df_ana if not df_ana.empty else df)  # used as 'ring' for turnover if present
+            stats = liquidity_stress_with_stats(
+                liq_data["median_spread_bps"], liq_data["ic_bps"], ring_df,
+                ss["liq_hist"].get(f"{sym}:{exp}")
             )
+            liq_data["liquidity_stress"] = stats["stress"]
+
+            # push to intraday history buffer
+            key = f"{sym}:{exp}"
+            buf = ss["liq_hist"].setdefault(key, [])
+            if stats["stress"] is not None:
+                buf.append(float(stats["stress"]))
+                if len(buf) > 480:    # ~ a full day @ 1 per tick
+                    del buf[:len(buf) - 480]
     
         # sentiment / PCR
         pcr_ring = compute_pcr(df_ana)
@@ -687,17 +703,28 @@ def render_app():
         st.markdown("---")
         st.subheader("Trading Overview (intraday lens)")
 
-        # Liquidity pack
+        # Liquidity pack (with intraday stats)
         liq_stats = compute_spread_stats(df_ana if not df_ana.empty else df, working_spot, band=3)
         icp = impact_cost_proxy(df_ana if not df_ana.empty else df, working_spot, qty=50)
-        liq_data = {}
+        liq_data, stats = {}, None
         if liq_stats and icp:
             liq_data["median_spread_bps"] = liq_stats.get("median_spread_bps")
             liq_data["ic_bps"] = icp.get("ic_bps")
-            liq_data["liquidity_stress"] = liquidity_stress(
-                liq_data["median_spread_bps"], liq_data["ic_bps"],
-                compute_money_map(df_ana if not df_ana.empty else df)
+            ring_df = compute_money_map(df_ana if not df_ana.empty else df)  # turnover if present
+            stats = liquidity_stress_with_stats(
+                liq_data["median_spread_bps"], liq_data["ic_bps"], ring_df,
+                ss["liq_hist"].get(f"{sym}:{exp}")
             )
+            liq_data["liquidity_stress"] = stats["stress"]
+
+            # push to intraday history buffer (so the percentile stabilizes intraday)
+            key = f"{sym}:{exp}"
+            buf = ss["liq_hist"].setdefault(key, [])
+            if stats["stress"] is not None:
+                buf.append(float(stats["stress"]))
+                if len(buf) > 480:  # keep ~1 trading day
+                    del buf[:len(buf) - 480]
+
         if liq_data:
             cL1, cL2, cL3 = st.columns(3)
             med_bps = liq_data.get("median_spread_bps")
@@ -711,6 +738,62 @@ def render_app():
                 f"{(stress * 100):.0f} / 100" if _isnum(stress) else "–",
                 help="Higher = harder fills"
             )
+                # Context vs today's intraday history
+            if stats is not None:
+                pct = stats.get("percentile_0_100")
+                zrb = stats.get("z_robust")
+                if (pct is not None) or (zrb is not None):
+                    st.caption(
+                        f"Liquidity stress vs today: "
+                        f"{(f'{pct:.0f}th pct' if pct is not None else '—')}"
+                        f"{' · ' if (pct is not None and zrb is not None) else ''}"
+                        f"{(f'z≈{zrb:+.2f}' if zrb is not None else '')}"
+                    )
+
+    # ---- 1% Execution Suite (additive; optional panel) ----
+    with st.expander("1% Execution Suite (edge ÷ pressure, size planner, INR slip)", expanded=False):
+        lot = st.number_input("Lot size", min_value=1, value=25, step=1, key="onepct_lot")
+        bps = st.number_input("Max slippage (bps)", min_value=1.0, value=10.0, step=1.0, key="onepct_bps")
+
+        # Use the same analytics ring you already derived
+        df_for_calc = df_ana if not df_ana.empty else df
+
+        dfp = liquidity_stress_v2(df_for_calc)                         # dials + liquidity_pressure_v2
+        dfp = estimate_rupee_impact(dfp, lot_size=int(lot))            # rupee_impact_per_lot
+        dfp = plan_order_sizes(dfp, max_slippage_bps=float(bps), lot_size=int(lot))  # max_lots_under_slippage
+        ranked = rank_strikes_by_edge_pressure(dfp)                    # edge_per_pressure, rank_epp
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Top strikes by Edge ÷ Pressure**")
+            st.dataframe(
+                ranked[["strike","edge_score","liquidity_pressure_v2","edge_per_pressure",
+                        "max_lots_under_slippage","rupee_impact_per_lot"]],
+                use_container_width=True, hide_index=True
+            )
+        with c2:
+            st.markdown("**Order Planner (₹ impact)**")
+            st.dataframe(
+                dfp[["strike","spread_pct","impact_proxy","rupee_impact_per_lot","max_lots_under_slippage"]],
+                use_container_width=True, hide_index=True
+            )
+
+        # Optional: alert-style filter for easy entries
+        try:
+            wins = find_execution_windows(ranked, pressure_pctile=0.25, min_edge_per_pressure=0.0)
+            if wins is not None and not wins.empty:
+                st.markdown("**Execution Windows (low pressure & positive edge)**")
+                st.dataframe(
+                    wins[["strike","edge_per_pressure","liquidity_pressure_v2","rupee_impact_per_lot","max_lots_under_slippage"]],
+                    use_container_width=True, hide_index=True
+                )
+        except Exception:
+            pass
+
+        with st.expander("Raw 1% debug (no rounding)", expanded=False):
+            st.dataframe(dfp, use_container_width=True, hide_index=True)
+            st.download_button("Download raw 1% table (CSV)", dfp.to_csv(index=False).encode("utf-8"),
+                               file_name="liquidity_1pct_raw.csv", mime="text/csv")
 
 
         st.markdown("---")
