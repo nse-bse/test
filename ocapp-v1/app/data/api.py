@@ -13,6 +13,9 @@ from config import (
 from utils.common import to_float
 from config import IST, now_ist
 
+# =========================
+# HTTP session (unchanged)
+# =========================
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
@@ -25,6 +28,9 @@ def get_http() -> requests.Session:
     s.mount("https://", HTTPAdapter(max_retries=retries))
     return s
 
+# =========================
+# Expiries (unchanged)
+# =========================
 @st.cache_data(show_spinner=False, ttl=300)
 def load_expiries(api_base: str, symbol: str) -> Tuple[List[str], Optional[str]]:
     url = f"{api_base}/expiries?symbol={symbol}"
@@ -46,6 +52,9 @@ def load_expiries(api_base: str, symbol: str) -> Tuple[List[str], Optional[str]]
             f"{e}",
         )
 
+# =========================
+# OC snapshots (unchanged)
+# =========================
 def load_snapshot_from_api(api_base: str, symbol: str, expiry: str) -> Optional[Dict]:
     try:
         url = f"{api_base}/oc?symbol={symbol}&expiry={expiry}"
@@ -82,7 +91,45 @@ def load_snapshot_from_hist_api(api_base: str, symbol: str, expiry: str, date: s
         st.error(f"Unexpected error during historical fetch: {e}")
         return None
 
-def load_cash_spot_from_api(api_base: str, symbol: str) -> Optional[float]:
+# ======================================================
+# Unified "truth of spot": prefer local Index OHLC LTP
+# ======================================================
+
+_INDEX_OHLC_URL = "http://localhost:8000/nse/index/ohlc"
+
+# Accept the usual variants you use across the app
+_INDEX_NAME_MAP = {
+    "NIFTY": "NIFTY 50",
+    "NIFTY 50": "NIFTY 50",
+    "NIFTY-I": "NIFTY 50",
+    "NIFTY_50": "NIFTY 50",
+    "BANKNIFTY": "NIFTY BANK",
+    "NIFTY BANK": "NIFTY BANK",
+    "BANKNIFTY-I": "NIFTY BANK",
+}
+
+def _symbol_to_index_name(symbol: str) -> Optional[str]:
+    if not symbol:
+        return None
+    k = symbol.strip().upper().replace("_", " ")
+    return _INDEX_NAME_MAP.get(k)
+
+# Keep a tiny cache so Streamlit reruns don't spam your local service.
+@st.cache_data(show_spinner=False, ttl=1.0)
+def _load_index_spot_from_local_api(index_human_name: str) -> Optional[float]:
+    try:
+        r = get_http().get(_INDEX_OHLC_URL, params={"symbols": index_human_name}, timeout=2.5)
+        if r.status_code != 200:
+            return None
+        data = r.json()  # {"High":..,"LTP":..,"Low":..,"Open":..}
+        v = to_float(data.get("LTP"))
+        if v is None or not np.isfinite(v) or not (1 <= v < 1e7):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+def _legacy_spot(api_base: str, symbol: str) -> Optional[float]:
     try:
         url = f"{api_base}/spot?symbol={symbol}"
         r = get_http().get(url, timeout=6)
@@ -94,6 +141,22 @@ def load_cash_spot_from_api(api_base: str, symbol: str) -> Optional[float]:
         pass
     return None
 
+def load_cash_spot_from_api(api_base: str, symbol: str) -> Optional[float]:
+    """
+    For index symbols, return cash index LTP from local OHLC.
+    Otherwise (or on failure), return the legacy REST spot.
+    Signature unchanged.
+    """
+    idx = _symbol_to_index_name(symbol)
+    if idx:
+        v = _load_index_spot_from_local_api(idx)
+        if v is not None:
+            return v
+    return _legacy_spot(api_base, symbol)
+
+# =========================
+# Digest (unchanged)
+# =========================
 def snapshot_digest(snap: Dict) -> str:
     try:
         opts = snap.get("options", []) or []

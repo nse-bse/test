@@ -109,12 +109,15 @@ def render_app():
         "Refresh interval (seconds for Fixed)", min_value=10, max_value=600, value=180, step=10
     )
 
-    st.sidebar.header("Spot source")
+    # default to Cash (API) for index symbols; else keep Futures
+    _index_syms = {"NIFTY", "BANKNIFTY", "NIFTY 50", "NIFTY BANK", "NIFTY-I", "BANKNIFTY-I"}
+    _default_spot_idx = 1 if symbol.upper() in _index_syms else 0
     spot_source = st.sidebar.selectbox(
         "Use spot as",
         ["Futures (from OC snapshot)", "Cash (API)", "Cash (estimate via parity)"],
-        index=0,
+        index=_default_spot_idx,
     )
+
 
     # ---------- Historical controls (manual-only; no auto-fetch) ----------
     if source == "Historical API":
