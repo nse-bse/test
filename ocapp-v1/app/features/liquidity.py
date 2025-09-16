@@ -238,49 +238,53 @@ def liquidity_stress_v2(df: pd.DataFrame) -> pd.DataFrame:
       - impact_proxy  (half-spread + thinness kicker)
       - liq_pressure_raw, liquidity_pressure_v2 (0..1)
     """
-    if df is None or df.empty: 
+    if df is None or df.empty:
         return pd.DataFrame()
 
     out = df.copy()
 
     # CE/PE mids + spread pct
-    if {"CE_ask","CE_bid"}.issubset(out.columns):
+    if {"CE_ask", "CE_bid"}.issubset(out.columns):
         out["ce_mid"] = _mid_series(out["CE_ask"], out["CE_bid"])
         out["ce_spread_pct"] = _spread_pct_series(out["CE_ask"], out["CE_bid"])
     else:
         out["ce_mid"] = np.nan
         out["ce_spread_pct"] = np.nan
 
-    if {"PE_ask","PE_bid"}.issubset(out.columns):
+    if {"PE_ask", "PE_bid"}.issubset(out.columns):
         out["pe_mid"] = _mid_series(out["PE_ask"], out["PE_bid"])
         out["pe_spread_pct"] = _spread_pct_series(out["PE_ask"], out["PE_bid"])
     else:
         out["pe_mid"] = np.nan
         out["pe_spread_pct"] = np.nan
 
-    # choose the better side (lower spread%) as executable side at that strike
+    # Choose the better (lower) spread% side at each strike
     out["spread_pct"] = np.nanmin(
-        np.vstack([out["ce_spread_pct"].to_numpy(), out["pe_spread_pct"].to_numpy()]), axis=0
+        np.vstack([out["ce_spread_pct"].to_numpy(), out["pe_spread_pct"].to_numpy()]),
+        axis=0,
     )
     out.loc[~np.isfinite(out["spread_pct"]), "spread_pct"] = np.nan
 
-    # impact proxy = 0.5*spread_pct + thin-liquidity kicker via inverse turnover if present
+    # Thin-liquidity kicker via inverse turnover if present
+    # IMPORTANT CHANGE: .fillna(0.0) so missing turnover contributes 0 (not NaN)
     tr = _to_num(out.get("turnover_ratio", pd.Series(np.nan, index=out.index))).replace(0, np.nan)
-    tr_inv_norm = (1.0 / tr).clip(lower=0, upper=10)
+    tr_inv_norm = (1.0 / tr).clip(lower=0, upper=10).fillna(0.0)  # ← key fix
 
+    # Impact proxy ~ half-spread + small kicker for thin books
     out["impact_proxy"] = (0.5 * out["spread_pct"]) + (0.02 * tr_inv_norm)
 
-    # raw pressure in bps-like scale
+    # Raw “bps-like” pressure
     out["liq_pressure_raw"] = out["impact_proxy"] * 1e4
 
-    # robust 0..1 normalization by 99th percentile
-    q = out["liq_pressure_raw"].quantile(0.99)
-    if pd.notna(q) and q > 0:
-        out["liquidity_pressure_v2"] = (out["liq_pressure_raw"] / q).clip(0, 1.0)
+    # Robust 0..1 normalization by 99th percentile (guard if all NaN/0)
+    q99 = out["liq_pressure_raw"].quantile(0.99)
+    if pd.notna(q99) and q99 > 0:
+        out["liquidity_pressure_v2"] = (out["liq_pressure_raw"] / q99).clip(0, 1.0)
     else:
         out["liquidity_pressure_v2"] = np.nan
 
     return out
+
 
 def estimate_rupee_impact(df: pd.DataFrame, *, lot_size: int = 25) -> pd.DataFrame:
     """
