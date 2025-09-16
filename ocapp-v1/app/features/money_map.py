@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 
@@ -41,11 +41,100 @@ def money_center_of_mass(dfm: pd.DataFrame, use_premium: bool=True) -> Optional[
     if w.fillna(0).sum() <= 0: return None
     return float((dfm["strike"]*w).sum() / w.sum())
 
-def find_walls(dfm: pd.DataFrame, z_thresh: float=1.5, k: int=4) -> pd.DataFrame:
-    if dfm.empty or "wall_z" not in dfm.columns: return pd.DataFrame()
-    cand = dfm[dfm["wall_z"] >= z_thresh][["strike","wall_z","tot_oi","prem_stock"]].copy()
-    return cand.sort_values(["wall_z","prem_stock","tot_oi"], ascending=False).head(k)
+def find_walls(
+    dfm: pd.DataFrame,
+    z_thresh: float = 1.5,
+    k: int = 4,
+    spot: Optional[float] = None
+) -> pd.DataFrame:
+    """
+    Detect OI/premium clusters ("walls") and classify as support / resistance / magnet.
 
+    Expects dfm to have at least: strike, wall_z, tot_oi, prem_stock.
+    Optionally uses any of: CE_oi, PE_oi, CE_ltp, PE_ltp, CE_prem_stock, PE_prem_stock.
+    """
+    if dfm.empty or "wall_z" not in dfm.columns:
+        return pd.DataFrame()
+
+    base_cols = ["strike", "wall_z", "tot_oi", "prem_stock"]
+    have = [c for c in ["CE_oi","PE_oi","CE_ltp","PE_ltp","CE_prem_stock","PE_prem_stock"] if c in dfm.columns]
+    cand = dfm[dfm["wall_z"] >= z_thresh][base_cols + have].copy()
+    if cand.empty:
+        return pd.DataFrame(columns=base_cols + ["CE_prem","PE_prem","type","type_reason","type_confidence"])
+
+    # --- CE/PE premium components with fallbacks ---
+    def _num(s): return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+    if {"CE_prem_stock","PE_prem_stock"}.issubset(cand.columns):
+        ce_prem = _num(cand["CE_prem_stock"])
+        pe_prem = _num(cand["PE_prem_stock"])
+    elif {"CE_oi","CE_ltp","PE_oi","PE_ltp"}.issubset(cand.columns):
+        ce_prem = _num(cand["CE_oi"]) * _num(cand["CE_ltp"])
+        pe_prem = _num(cand["PE_oi"]) * _num(cand["PE_ltp"])
+    elif {"CE_oi","PE_oi"}.issubset(cand.columns):
+        # Proxy using OI if LTP unavailable
+        ce_prem = _num(cand["CE_oi"])
+        pe_prem = _num(cand["PE_oi"])
+    else:
+        # Last resort: split prem_stock evenly → gives mixed → low confidence
+        half = _num(cand["prem_stock"]) * 0.5
+        ce_prem = half
+        pe_prem = half
+
+    cand["CE_prem"] = ce_prem
+    cand["PE_prem"] = pe_prem
+
+    # --- take top-k by strength ---
+    cand = cand.sort_values(["wall_z","prem_stock","tot_oi"], ascending=False).head(k).copy()
+
+    # --- strike step for "near spot" ---
+    try:
+        step = float(np.median(np.diff(np.sort(dfm["strike"].dropna().unique()))))
+    except Exception:
+        step = 100.0
+
+    # --- classification ---
+    types, reasons, confs = [], [], []
+    for _, r in cand.iterrows():
+        k_strike = float(r["strike"])
+        ce, pe = float(r["CE_prem"]), float(r["PE_prem"])
+        tot = ce + pe
+        dom = (abs(ce - pe) / tot) if tot > 0 else 0.0  # dominance 0..1
+        conf = float(np.clip(dom, 0.0, 1.0))
+
+        if spot is None or not np.isfinite(spot):
+            # No spot → only composition available
+            if pe > ce:
+                t, reason = "support", "PE-dominated (no spot)"
+            elif ce > pe:
+                t, reason = "resistance", "CE-dominated (no spot)"
+            else:
+                t, reason, conf = "neutral", "mixed (no spot)", 0.25
+        else:
+            near = abs(k_strike - spot) <= 0.5 * step
+            if near:
+                t, reason, conf = "magnet", "near spot", max(conf, 0.4)
+            elif (pe >= ce) and (k_strike < spot):
+                t, reason, conf = "support", "PE-dominated below spot", min(1.0, conf + 0.3)
+            elif (ce >= pe) and (k_strike > spot):
+                t, reason, conf = "resistance", "CE-dominated above spot", min(1.0, conf + 0.3)
+            elif pe > ce and k_strike > spot:
+                t, reason, conf = "support", "PE-dominated but above spot", max(0.2, conf * 0.6)
+            elif ce > pe and k_strike < spot:
+                t, reason, conf = "resistance", "CE-dominated but below spot", max(0.2, conf * 0.6)
+            else:
+                t, reason, conf = "neutral", "mixed", 0.25
+
+        types.append(t); reasons.append(reason); confs.append(conf)
+
+    cand["type"] = types
+    cand["type_reason"] = reasons
+    cand["type_confidence"] = confs
+
+    # Clean display names (optional)
+    cand = cand.rename(columns={"prem_stock": "premium", "wall_z": "wall_z (σ)"})
+
+    return cand.reset_index(drop=True)
 def make_money_map_commentary(dfm: pd.DataFrame, spot: Optional[float]) -> str:
     if dfm.empty: return "Money Map not available."
     parts = []

@@ -300,25 +300,42 @@ def render_app():
 
     df, fut_spot, all_fields = group_chain(snapshot)
 
-    # Spot routing
+    # ---- Spot routing ----
     cash_spot = None
-    if symbol in FNO_STOCKS:  # STOCKS → always Cash(API)
-        cash_spot = load_cash_spot_from_api(api_base, sym)
-        working_spot = cash_spot if cash_spot is not None else fut_spot
-        if cash_spot is None:
-            st.warning("Cash spot unavailable for stock; using Futures spot.")
-    else:  # INDICES → honor dropdown
+
+    if source == "Historical API":
+        # Historical mode: never hit live cash; use snapshot futures or parity estimate
         working_spot = fut_spot
+        if spot_source == "Cash (estimate via parity)":
+            cash_spot = estimate_cash_spot_parity_consistent(df, fut_spot)
+            if cash_spot is None:
+                st.warning("Historical: parity estimate unavailable; using Futures spot from snapshot.")
+            working_spot = cash_spot if cash_spot is not None else fut_spot
+
+        # If user selected live Cash(API) by mistake, ignore it (avoid EOD/live pollution)
         if spot_source == "Cash (API)":
+            st.info("Historical mode: ignoring live Cash (API); using Futures/parity instead.")
+
+    else:
+        # Live mode: keep existing behavior
+        if symbol in FNO_STOCKS:  # STOCKS → always Cash(API)
             cash_spot = load_cash_spot_from_api(api_base, sym)
             working_spot = cash_spot if cash_spot is not None else fut_spot
             if cash_spot is None:
-                st.warning("Cash spot unavailable; using Futures spot.")
-        elif spot_source == "Cash (estimate via parity)":
-            cash_spot = estimate_cash_spot_parity_consistent(df, fut_spot)
-            working_spot = cash_spot if cash_spot is not None else fut_spot
-            if cash_spot is None:
-                st.warning("Parity estimate unavailable; using Futures spot.")
+                st.warning("Cash spot unavailable for stock; using Futures spot.")
+        else:  # INDICES → honor dropdown
+            working_spot = fut_spot
+            if spot_source == "Cash (API)":
+                cash_spot = load_cash_spot_from_api(api_base, sym)
+                working_spot = cash_spot if cash_spot is not None else fut_spot
+                if cash_spot is None:
+                    st.warning("Cash spot unavailable; using Futures spot.")
+            elif spot_source == "Cash (estimate via parity)":
+                cash_spot = estimate_cash_spot_parity_consistent(df, fut_spot)
+                working_spot = cash_spot if cash_spot is not None else fut_spot
+                if cash_spot is None:
+                    st.warning("Parity estimate unavailable; using Futures spot.")
+
 
     # Keep a short spot history (floats) for RV & diagnostics
     if did_fetch and (working_spot is not None):
@@ -813,10 +830,17 @@ def render_app():
         if em:
             st.metric("Expected move (1σ)", f"±{em['sigma_pts']:.0f} pts")
             c = em["cones"]
-            st.caption(
-                f"Cones → 25%: {c[0.25][0]:.0f} ↔ {c[0.25][1]:.0f} | "
-                f"50%: {c[0.50][0]:.0f} ↔ {c[0.50][1]:.0f} | "
-                f"75%: {c[0.75][0]:.0f} ↔ {c[0.75][1]:.0f}"
+            st.markdown(
+                f"""
+                <div style='background-color:#f8f9fa; padding:6px 10px; border-radius:8px; 
+                            border:1px solid #ddd; font-size:0.9rem;'>
+                    <b>🎯 Cones:</b> 
+                    <span style='color:#2c3e50;'>25% → <b>{c[0.25][0]:.0f}</b> ↔ <b>{c[0.25][1]:.0f}</b></span> &nbsp;|&nbsp;
+                    <span style='color:#2980b9;'>50% → <b>{c[0.50][0]:.0f}</b> ↔ <b>{c[0.50][1]:.0f}</b></span> &nbsp;|&nbsp;
+                    <span style='color:#8e44ad;'>75% → <b>{c[0.75][0]:.0f}</b> ↔ <b>{c[0.75][1]:.0f}</b></span>
+                </div>
+                """,
+                unsafe_allow_html=True
             )
 
         sup_zones, res_zones = summarize_zones(df_ana, top_n=2)
@@ -1024,7 +1048,7 @@ def render_app():
             c1,c2,c3 = st.columns(3)
             c1.metric("Premium Center", f"{cm_p:.0f}" if cm_p else "–")
             c2.metric("OI Center", f"{cm_o:.0f}" if cm_o else "–")
-            wall_tbl = find_walls(dfm, z_thresh=1.5, k=4)
+            wall_tbl = find_walls(dfm, z_thresh=1.5, k=4, spot=working_spot)
             c3.metric("Walls flagged", f"{len(wall_tbl)}")
 
             # Wall-shift velocity vs previous ring snapshot
@@ -1335,7 +1359,7 @@ def render_app():
         walls_list = []
         if not walls_tbl.empty:
             for _, r in walls_tbl.iterrows():
-                walls_list.append({"strike": float(r["strike"]), "z": float(r["wall_z"]), "type": "support" if r.get("type","support")=="support" else "resistance"})
+                walls_list.append({"strike": float(r["strike"]),"z": float(r.get("wall_z", r.get("wall_z (σ)", float("nan")))), "type": "support" if r.get("type","support")=="support" else "resistance"})
         prev_frames = get_last_frames(sym, exp, n=2)
         prev_walls_tbl = pd.DataFrame()
         if len(prev_frames) == 2:
