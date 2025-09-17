@@ -134,3 +134,82 @@ def velocity_spike_table(vel_df: pd.DataFrame, k: int = 5, threshold: Optional[f
     out["velocity"] = out["velocity"].round(0).astype("Int64")
     out["strike"] = out["strike"].round(0).astype("Int64")
     return out[["strike","velocity","Label"]]
+# -------------------- Disk persistence (added) --------------------
+import os, re, glob
+from datetime import datetime
+
+def _dh_safe_dir(base: str, sym: str, exp: str, ts_iso: str) -> str:
+    """
+    Builds: data/live/<SYM>/<EXP>/<YYYY-MM-DD>/
+    """
+    sym = re.sub(r"[^A-Z0-9_]+", "_", str(sym).upper())
+    exp = re.sub(r"[^A-Z0-9_]+", "_", str(exp).upper())
+    try:
+        d = datetime.fromisoformat(str(ts_iso).replace("Z", "+00:00")).date().isoformat()
+    except Exception:
+        d = datetime.now().date().isoformat()
+    return os.path.join("data", "live", sym, exp, d)
+
+def persist_live_ring_snapshot(sym: str, exp: str, ts_iso: str, df_ring: pd.DataFrame) -> str | None:
+    """
+    Save the ring-level DataFrame for a live snapshot to disk as Parquet.
+    Returns the filepath or None on failure.
+    """
+    try:
+        outdir = _dh_safe_dir("data/live", sym, exp, ts_iso)
+        os.makedirs(outdir, exist_ok=True)
+        try:
+            t = datetime.fromisoformat(str(ts_iso).replace("Z", "+00:00")).strftime("%H%M%S")
+        except Exception:
+            t = datetime.now().strftime("%H%M%S")
+        fp = os.path.join(outdir, f"{t}.parquet")
+        df_ring.to_parquet(fp, index=False)
+        return fp
+    except Exception:
+        return None
+
+def load_live_ring_history(sym: str, exp: str, date_iso: str | None = None, limit: int | None = None) -> list[pd.DataFrame]:
+    """
+    Load today's (or a given date's) saved ring snapshots from disk (Parquet files).
+    Returns a list of DataFrames ordered by time.
+    """
+    if date_iso is None:
+        date_iso = datetime.now().date().isoformat()
+    base = os.path.join("data", "live", re.sub(r"[^A-Z0-9_]+","_", sym.upper()), re.sub(r"[^A-Z0-9_]+","_", exp.upper()), date_iso)
+    files = sorted(glob.glob(os.path.join(base, "*.parquet")))
+    if limit is not None and limit > 0:
+        files = files[-limit:]
+    out = []
+    for f in files:
+        try:
+            df = pd.read_parquet(f)
+            # best-effort timestamp from filename
+            ts = os.path.splitext(os.path.basename(f))[0]  # HHMMSS
+            df = df.copy()
+            df["timestamp"] = ts
+            out.append(df)
+        except Exception:
+            continue
+    return out
+
+def hydrate_inmemory_from_disk(sym: str, exp: str, limit: int = 60):
+    """
+    Optional: re-populate the in-memory history using the files saved to disk,
+    so existing analytics that read the in-memory buffers continue to work.
+    """
+    frames = load_live_ring_history(sym, exp, limit=limit)
+    # Reuse existing helper if available:
+    try:
+        for df in frames:
+            ts = df["timestamp"].iloc[0] if "timestamp" in df.columns and len(df) else ""
+            # record_ring_snapshot stores history for non-live; push_live_ring_snapshot is what live mode uses.
+            # Use whichever your app expects for live buffers:
+            try:
+                push_live_ring_snapshot(sym, exp, ts, df, digest=None)  # noqa: F821 (exists in this module)
+            except Exception:
+                try:
+                    record_ring_snapshot(sym, exp, ts, df)  # noqa: F821
+                except Exception:
+                    pass
+    except Exception:
+        pass

@@ -8,7 +8,10 @@ import streamlit as st
 import altair as alt
 import json
 import requests
-
+from typing import List, Dict, Optional, Tuple
+import numpy as np
+import pandas as pd
+import streamlit as st
 # ------------------ local modules ------------------
 from config import (
     now_ist, IST,
@@ -16,6 +19,7 @@ from config import (
     FNO_STOCKS, INDEX_SYMBOLS,
 )
 from utils.time_utils import market_bounds, next_refresh_in_seconds, on_market_tick
+from features.playbook import build_playbook, render_playbook_card  # <— add RiskConfig
 from data.api import (
     load_expiries, load_snapshot_from_api, load_snapshot_from_hist_api,
     load_cash_spot_from_api, snapshot_digest,
@@ -30,7 +34,9 @@ from calculations.iv_skew import (
 from state.history import (
     push_live_ring_snapshot, record_ring_snapshot, make_long_history,
     get_last_frames, velocity_spike_table,
+    persist_live_ring_snapshot, load_live_ring_history, hydrate_inmemory_from_disk,
 )
+
 from features.gamma_and_rails import (
     compute_gamma_regime, compute_iv_rails, detect_stop_hunt, score_zones,
     summarize_zones, summarize_trade_bias, build_trade_commentary, _format_zone_list,
@@ -56,7 +62,6 @@ from features.predict import (
     expected_move_nowcast, pin_probability, breakout_probabilities,
     wall_shift_velocity, session_phase,
 )
-
 # Soft dependency: heartbeat
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -149,6 +154,7 @@ def render_app():
     ss.setdefault("last_hist_digest", None)
     ss.setdefault("spot_hist", {})  # {f"{sym}:{exp}": [spot,...]}
     ss.setdefault("api_hits", 0)
+    ss.setdefault("last_fetch_dt", None)
 
     # Historical manual control state
     ss.setdefault("hist_date_pending", datetime.today().date())
@@ -156,6 +162,7 @@ def render_app():
     ss.setdefault("hist_sel_key", None)
     ss.setdefault("current_source", None)
     ss.setdefault("liq_hist", {})   # { "SYM:EXP": [stress0..n] }  (floats 0..1)
+    ss.setdefault("hydrated_live_disk", False)
 
     # ---- sidebar: source & symbol ----
     st.sidebar.header("Data Source & Symbol")
@@ -191,6 +198,7 @@ def render_app():
         index=_default_spot_idx,
     )
 
+
     # ---- view controls ----
     st.sidebar.header("View")
     strike_window = st.sidebar.slider("± Strikes around ATM", min_value=5, max_value=40, value=15, step=1)
@@ -221,6 +229,15 @@ def render_app():
             ss["hist_sel_key"] = sel_key
             ss["snapshot"] = None
             ss["last_hist_digest"] = None
+           
+            # NEW: clear in-memory frames for this sym:exp so we don't mix contexts
+            try:
+                st.session_state.setdefault("live_buffers", {}).pop(f"{symbol}:{expiry}", None)
+            except Exception:
+                pass
+            # reset active date tracking (we set it again on first fetch)
+            ss.pop("hist_active_key", None)
+   
 
     # ---- fetch logic ----
     snapshot = ss["snapshot"]
@@ -228,28 +245,43 @@ def render_app():
     seconds_to_next_tick = None
     did_fetch = False
 
-    if source == "Live API" and ss.get("last_fetch") is not None:
+    if source == "Live API":
+        # → store last fetch as a timezone-aware datetime, not epoch
+        ss.setdefault("last_fetch_dt", None)
+
         auto = st.sidebar.checkbox("Auto refresh", value=True)
         fetch_live_now = st.sidebar.button("Fetch Live Snapshot")
+
+        # figure next tick + should_fetch
         if auto:
             if cadence_mode.startswith("Market"):
-                seconds_to_next_tick = next_refresh_in_seconds(now)
-                should_fetch = on_market_tick(now, ss["last_fetch"])
+                # countdown to the next market-tick (09:15 → 09:17 → every 3 min)
+                seconds_to_next_tick = next_refresh_in_seconds(now)  # may be None outside hours
+                should_fetch = on_market_tick(now, ss.get("last_fetch_dt"))
             else:
-                elapsed = time.time() - ss["last_fetch"]
+                # Fixed seconds cadence
+                last_dt = ss.get("last_fetch_dt") or (now - timedelta(days=1))
+                elapsed = (now - last_dt).total_seconds()
                 seconds_to_next_tick = int(max(0, refresh_sec - elapsed))
                 should_fetch = elapsed >= refresh_sec
         else:
             should_fetch = False
-        if fetch_live_now: should_fetch = True
+
+        if fetch_live_now:
+            should_fetch = True
+
         if should_fetch:
             ss["snapshot"] = load_snapshot_from_api(api_base, symbol, expiry)
-            ss["last_fetch"] = time.time()
+            ss["last_fetch_dt"] = now_ist()  # store as datetime (used by on_market_tick)
             ss["last_live_digest"] = snapshot_digest(ss["snapshot"]) if ss["snapshot"] else None
             ss["api_hits"] += 1
             did_fetch = True
+
+            # reset the visible countdown right after a fetch
             now = now_ist()
-            seconds_to_next_tick = next_refresh_in_seconds(now) if cadence_mode.startswith("Market") else int(refresh_sec)
+            seconds_to_next_tick = (
+                next_refresh_in_seconds(now) if cadence_mode.startswith("Market") else int(refresh_sec)
+            ) 
 
     elif source == "Historical API":
         with st.sidebar.expander("Historical Settings", expanded=True):
@@ -266,17 +298,113 @@ def render_app():
                 default_idx = len(all_times) - 1
             sel_time = st.selectbox("Time (HH:MM)", all_times, index=default_idx, key="hist_time_select")
             ss["hist_time_pending"] = sel_time
+            backfill_depth = st.number_input(
+               "Backfill frames (prior slots)", min_value=0, max_value=120, value=10, step=1,
+               help="Load this many previous 3-min slots so Velocity/Flows compare like Live."
+            )
             fetch_hist_now = st.button("Fetch Historical Snapshot", use_container_width=True)
             st.caption("Changing Date/Time does not update the view. Click **Fetch** to load that snapshot.")
         if fetch_hist_now:
             pending_date = ss.get("hist_date_pending", datetime.today().date())
             pending_time = ss.get("hist_time_pending", "15:30")
+
+            # NEW (1): reset in-memory frames if date (or sym/exp) changed
+            if ss.get("hist_active_key") != (symbol, expiry, pending_date):
+                try:
+                    st.session_state.setdefault("live_buffers", {}).pop(f"{symbol}:{expiry}", None)
+                except Exception:
+                    pass
+                ss["hist_active_key"] = (symbol, expiry, pending_date)
+
+            # NEW (2): backfill a few prior frames so diffs work immediately
+            try:
+                HIST_BACKFILL = 3  # ~9 minutes if your slot step is 3m
+
+                # 'all_times' already built above via _slots()
+                slots = list(all_times)
+                cur_idx = slots.index(pending_time) if pending_time in slots else len(slots) - 1
+                back_idxs = list(range(max(0, cur_idx - HIST_BACKFILL), cur_idx))
+
+                # push prior frames in chronological order
+                for i in back_idxs:
+                    tprev = slots[i]
+                    snap_prev = load_snapshot_from_hist_api(
+                        api_base, symbol, expiry, pending_date.strftime("%Y-%m-%d"), tprev
+                    )
+                    if not snap_prev:
+                        continue
+                   
+                    df_prev, fut_prev, _ = group_chain(snap_prev)
+                    if df_prev is None or df_prev.empty:
+                        continue
+                   
+                    # Historical uses futures/parity (never live cash API)
+                    wspot_prev = fut_prev
+                    if spot_source == "Cash (estimate via parity)":
+                        est = estimate_cash_spot_parity_consistent(df_prev, fut_prev)
+                        if est is not None:
+                            wspot_prev = est
+                    if wspot_prev is None:
+                        continue
+                   
+                    atm_prev = find_atm_index(df_prev, wspot_prev)
+                    df_prev_ring = df_prev.iloc[
+                        max(0, atm_prev - fixed_skew_ring):min(len(df_prev), atm_prev + fixed_skew_ring + 1)
+                    ].reset_index(drop=True)
+
+                    # record the previous frame (used by velocity/IV-flow/wall-shift etc.)
+                    record_ring_snapshot(
+                        snap_prev.get("symbol", symbol),
+                        snap_prev.get("expiry", expiry),
+                        snap_prev.get("timestamp", f"{pending_date} {tprev}"),
+                        df_prev_ring
+                    )
+            except Exception:
+                pass
+           
+            # Current snapshot (unchanged)
             ss["snapshot"] = load_snapshot_from_hist_api(
                 api_base, symbol, expiry, pending_date.strftime("%Y-%m-%d"), pending_time
             )
             ss["last_hist_digest"] = snapshot_digest(ss["snapshot"]) if ss["snapshot"] else None
             ss["api_hits"] += 1
             did_fetch = True
+
+            # --- Backfill earlier slots so diffs (velocity/flows) work like Live ---
+            try:
+                # Find the selected time index
+                idx = all_times.index(pending_time)
+            except ValueError:
+                idx = len(all_times) - 1
+
+            start_idx = max(0, idx - int(backfill_depth))
+            for t in all_times[start_idx:idx]:
+                snap_prev = load_snapshot_from_hist_api(
+                    api_base, symbol, expiry, pending_date.strftime("%Y-%m-%d"), t
+                )
+                if not snap_prev:
+                    continue
+               
+                df_prev, fut_prev, _ = group_chain(snap_prev)
+                if df_prev is None or df_prev.empty:
+                    continue
+               
+                # Choose spot exactly like Historical mode uses above (Futures or Parity)
+                wspot_prev = fut_prev
+                if spot_source == "Cash (estimate via parity)":
+                    est_prev = estimate_cash_spot_parity_consistent(df_prev, fut_prev)
+                    if est_prev is not None:
+                        wspot_prev = est_prev
+
+                # Build the same analytics ring used everywhere else
+                atm_prev = find_atm_index(df_prev, wspot_prev)
+                ring_prev = df_prev.iloc[
+                    max(0, atm_prev - fixed_skew_ring):min(len(df_prev), atm_prev + fixed_skew_ring + 1)
+                ].reset_index(drop=True)
+
+                if not ring_prev.empty:
+                    # Record to in-memory history (this is what velocity/flows read from)
+                    record_ring_snapshot(symbol, expiry, snap_prev.get("timestamp", t), ring_prev)
 
     snapshot = ss["snapshot"]
     if snapshot is None:
@@ -298,7 +426,16 @@ def render_app():
     exp = snapshot.get("expiry", expiry)
     ts = snapshot.get("timestamp", "?")
 
+    # --- hydrate in-memory buffers from disk if live mode (run once) ---
+    if source == "Live API" and not ss.get("hydrated_live_disk"):
+        try:
+            # restore last ~120 ring frames so velocity, wall-shift, IV-flow work right after refresh
+            hydrate_inmemory_from_disk(sym, exp, limit=120)
+        finally:
+            ss["hydrated_live_disk"] = True
+
     df, fut_spot, all_fields = group_chain(snapshot)
+
 
     # ---- Spot routing ----
     cash_spot = None
@@ -358,12 +495,19 @@ def render_app():
     df_ana = df.iloc[max(0, atm_idx - fixed_skew_ring):min(len(df), atm_idx + fixed_skew_ring + 1)].reset_index(drop=True)
     atm_idx_ana = atm_idx - max(0, atm_idx - fixed_skew_ring)
 
-    # record frames
-    if did_fetch:
-        if source == "Live API":
-            push_live_ring_snapshot(sym, exp, ts, df_ana, ss.get("last_live_digest"))
-        else:
+    # record frames (in-memory for BOTH sources; persist to disk only for Live)
+    if did_fetch and working_spot is not None and not df_ana.empty:
+        try:
+            # make velocity/flows/wall-shift/etc. work in Historical too
             record_ring_snapshot(sym, exp, ts, df_ana)
+
+            # keep your existing on-disk persistence for Live sessions
+            if source == "Live API":
+                persist_live_ring_snapshot(sym, exp, ts, df_ana)
+        except Exception:
+            pass
+
+
 
     if "net_oi_change" in df.columns and "net_oi_change" not in all_fields:
         all_fields.append("net_oi_change")
@@ -393,111 +537,207 @@ def render_app():
 
     # --------------------------- Title + header ---------------------------
     st.title("Option Chain Dashboard")
-    topL, topR = st.columns([3,1])
+    topL, topR = st.columns([3, 1])
+   
     with topL:
         st.caption(f"Last fetched: {ts}")
-        if source == "Live API" and seconds_to_next_tick is not None:
+   
+        if source == "Live API":
             if cadence_mode.startswith("Market"):
-                st.caption(
-                    f"Next market tick in ~{seconds_to_next_tick}s → "
-                    f"at **{(now + timedelta(seconds=seconds_to_next_tick)).strftime('%H:%M:%S')} IST** "
-                    "(09:15 → 09:17 → every 3 mins)"
-                )
+                # Market schedule (09:15 → 09:17 → every 3 min)
+                if seconds_to_next_tick is not None:
+                    eta_dt = now + timedelta(seconds=int(seconds_to_next_tick))
+                    st.caption(
+                        f"Next market tick in ~{int(seconds_to_next_tick)}s → "
+                        f"at **{eta_dt.strftime('%H:%M:%S')} IST** "
+                        "(09:15 → 09:17 → every 3 mins)"
+                    )
+                else:
+                    # Outside market hours or helper returned None — say why
+                    mstart, mend = market_bounds(now)
+                    if mend and now >= mend:
+                        st.caption("Market closed — auto-refresh arms again at next session open (first tick 09:15 IST).")
+                    elif mstart and now < mstart:
+                        st.caption("Before market open — first tick will fire at **09:15 IST**.")
+                    else:
+                        st.caption("Waiting for next eligible market tick …")
             else:
-                st.caption(
-                    f"Auto-fetch in ~{seconds_to_next_tick}s → "
-                    f"at **{(now + timedelta(seconds=seconds_to_next_tick)).strftime('%H:%M:%S')} IST**"
-                )
+                # Fixed-seconds cadence
+                if seconds_to_next_tick is not None:
+                    eta_dt = now + timedelta(seconds=int(seconds_to_next_tick))
+                    st.caption(
+                        f"Auto-fetch in ~{int(seconds_to_next_tick)}s → "
+                        f"at **{eta_dt.strftime('%H:%M:%S')} IST**"
+                    )
+   
     with topR:
         st.metric("API hits (session)", ss.get("api_hits", 0))
 
+
     # ---- Tabs (added 'Commentary') ----
-    tab_overview, tab_runway, tab_money, tab_chain, tab_writing, tab_velocity, tab_movers, tab_iv, tab_commentary, tab_diag = st.tabs(
-        ["Overview", "Gates & Runway", "Money Map", "Chain", "Writing", "Velocity", "Movers", "IV & Skew", "Commentary", "Diagnostics"]
+    tab_overview, tab_playbook, tab_runway, tab_money, tab_chain, tab_writing, tab_velocity, tab_movers, tab_iv, tab_commentary, tab_diag = st.tabs(
+        ["Overview", "Playbook", "Gates & Runway", "Money Map", "Chain", "Writing", "Velocity", "Movers", "IV & Skew", "Commentary", "Diagnostics"]
     )
+
+    # --------------------------- Playbook ---------------------------
+    with tab_playbook:
+        st.subheader("Instant Trade Playbook")
+
+        # small, cheap recompute of inputs we need
+        df_for_calc = df_ana if not df_ana.empty else df
+        atm_iv_now = compute_atm_iv(df_for_calc, working_spot)
+        iv_hist = make_iv_skew_history(sym, exp, last_n=40)
+        iv_z = zscore_last(iv_hist["atm_iv"], window=20) if (iv_hist is not None and not iv_hist.empty and "atm_iv" in iv_hist) else None
+        regime, _gex = compute_gamma_regime(df_for_calc, working_spot, ring_size=fixed_skew_ring if fixed_skew_ring else 10)
+
+        mstart2, mend2 = market_bounds(now)
+        minutes_left = max(1, (mend2 - now).total_seconds() / 60.0) if mend2 else 60.0
+        rails = compute_iv_rails(working_spot, atm_iv_now, minutes_left)
+        em = expected_move_nowcast(working_spot, atm_iv_now, minutes_left)
+
+        # money map + walls (for reference/pin/levels)
+        dfm_local = compute_money_map(df_for_calc)
+        wall_tbl = find_walls(dfm_local, z_thresh=1.5, k=4) if not dfm_local.empty else pd.DataFrame()
+
+        # pin probabilities (cheap)
+        gc = gex_curve(df_for_calc, working_spot)
+        pin_top = None; pin_k = None
+        if em and not gc.empty:
+            probs_df, pin_k_val = pin_probability(gc, working_spot, em["sigma_pts"])
+            if probs_df is not None and not probs_df.empty:
+                pin_top = float(probs_df["pin_prob"].iloc[0])
+                pin_k = float(pin_k_val)
+
+        # velocity tilt for bias
+        _, vel_df_local = make_long_history(sym, exp, last_n=10)
+
+        # liquidity stress (reuse quick pack from Overview)
+        liq_stats_pb = compute_spread_stats(df_for_calc, working_spot, band=3)
+        icp_pb = impact_cost_proxy(df_for_calc, working_spot, qty=50)
+        liq_stress = None
+        if liq_stats_pb and icp_pb:
+            ring_df_pb = compute_money_map(df_ana if not df_ana.empty else df)
+            liq_stress = liquidity_stress(
+                liq_stats_pb.get("median_spread_bps"), icp_pb.get("ic_bps"), ring_df_pb
+            )
+
+        # direction score (reuse your helper)
+        dir_score_pb = _direction_score(regime, iv_z, vel_df_local, None, None, None, compute_pcr(df_for_calc))
+
+        plays = build_playbook(
+            df_ring=df_for_calc,
+            working_spot=working_spot,
+            rails=rails,
+            em=em,
+            pcr=compute_pcr(df_for_calc),
+            iv_z=iv_z,
+            regime=regime,
+            vel_df=vel_df_local,
+            pin_k=pin_k,
+            pin_top=pin_top,
+            walls_tbl=wall_tbl,
+            liq_stress=liq_stress,
+            direction_score=dir_score_pb,
+        )
+
+        if not plays:
+            st.info("Not enough data to construct a playbook yet. Fetch a snapshot or reduce ring strictness.")
+        else:
+            for p in plays:
+                render_playbook_card(p, lot_size_default=25)
+
+            # export
+            export = [{"name":p["name"], "bias":p["bias"], "legs":p["legs"], "levels":p.get("levels"), "size_lots":p.get("size_lots")} for p in plays]
+            st.download_button(
+                "Download playbook.json",
+                data=(json.dumps(export, indent=2)).encode("utf-8"),
+                file_name=f"playbook_{sym}_{exp}_{ts.replace(':','-')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
 
     # --------------------------- Commentary (One-Glance + Narrative + AI JSON) ---------------------------
     with tab_commentary:
         st.subheader("One-Glance Commentary")
-    
-        # ---------- helpers ----------
-        def _isnum(x):
+       
+        # ---------- helpers (avoid shadowing module-level names) ----------
+        def _isnum_local(x):
             return isinstance(x, (int, float, np.floating)) and np.isfinite(x)
-    
+       
         def _fmt(x, n=2, suffix=""):
-            return f"{x:.{n}f}{suffix}" if _isnum(x) else "–"
-    
+            return f"{x:.{n}f}{suffix}" if _isnum_local(x) else "–"
+       
         def _pct(x):
-            return f"{x*100:.0f}%" if _isnum(x) else "–"
-    
+            return f"{x*100:.0f}%" if _isnum_local(x) else "–"
+       
         def _safe_mean(vs):
-            vs = [v for v in vs if _isnum(v)]
+            vs = [v for v in vs if _isnum_local(v)]
             return float(np.mean(vs)) if vs else None
-    
+       
         # Direction score: 0 (mean revert) .. 100 (directional)
-        def _direction_score(regime, iv_z, vel_df, up_tbl, down_tbl, net_flow, pcr_ring):
+        def _direction_score_local(regime, iv_z, vel_df, up_tbl, down_tbl, net_flow, pcr_ring):
             score = 50.0
-    
+       
             # gamma regime
             if isinstance(regime, str):
                 if "Short" in regime: score += 15
                 elif "Long" in regime: score -= 15
-    
+       
             # IV impulse
-            if _isnum(iv_z):
+            if _isnum_local(iv_z):
                 score += np.clip(abs(iv_z), 0, 4) * 6  # up to +24 on big impulse
-    
+       
             # runway pass ratios
             def _pass_ratio(tbl):
                 if tbl is None or isinstance(tbl, (list, tuple)) or len(getattr(tbl, "columns", [])) == 0: 
                     return None
                 return float(tbl["gate_ok"].mean()) if "gate_ok" in tbl.columns and len(tbl) else None
             r_up, r_dn = _pass_ratio(up_tbl), _pass_ratio(down_tbl)
-            if _isnum(r_up) or _isnum(r_dn):
+            if _isnum_local(r_up) or _isnum_local(r_dn):
                 # favor the stronger side
                 d = (r_up or 0) - (r_dn or 0)
                 score += d * 20  # +/-20 tilt
-    
+       
             # velocity (net)
             if vel_df is not None and not vel_df.empty and "velocity" in vel_df.columns:
                 v = float(vel_df["velocity"].sum())
                 score += np.tanh(v / 5_000) * 10  # soft clip
-    
+       
             # vega-weighted IV net flow (signed)
-            if _isnum(net_flow):
+            if _isnum_local(net_flow):
                 score += np.tanh(net_flow / 1e6) * 10
-    
+       
             # PCR tilt (extremes reduce trend score)
-            if _isnum(pcr_ring):
+            if _isnum_local(pcr_ring):
                 if pcr_ring > 1.4: score -= 6   # heavy put writing bias → reversion risk
                 if pcr_ring < 0.6: score -= 6   # heavy call writing bias → reversion risk
-    
+       
             return int(np.clip(score, 0, 100))
-    
+       
         # ---------- inputs & light recompute ----------
         now2 = now_ist()
         df_for_calc = df_ana if not df_ana.empty else df
-    
+       
         atm_iv_now = compute_atm_iv(df_for_calc, working_spot)
         iv_hist = make_iv_skew_history(sym, exp, last_n=40)
         iv_z = zscore_last(iv_hist["atm_iv"], window=20) if (iv_hist is not None and not iv_hist.empty and "atm_iv" in iv_hist) else None
-    
+       
         regime, gex_val = compute_gamma_regime(df_for_calc, working_spot, ring_size=fixed_skew_ring if fixed_skew_ring else 10)
-    
+       
         mstart, mend = market_bounds(now2)
         minutes_left = max(1, (mend - now2).total_seconds() / 60.0) if mend else 60.0
-    
+       
         rails = compute_iv_rails(working_spot, atm_iv_now, minutes_left)
         em = expected_move_nowcast(working_spot, atm_iv_now, minutes_left)
-    
+       
         r50 = rails.get(0.5) if isinstance(rails, dict) else None
         breakout = breakout_probabilities(working_spot, r50, em["sigma_pts"]) if (r50 and em) else None
-    
+       
         gc = gex_curve(df_for_calc, working_spot)
         probs, pin_k = (None, None)
         if em and not gc.empty:
             probs, pin_k = pin_probability(gc, working_spot, em["sigma_pts"])
-    
+       
         # runway quick calc (non-strict; small lookback)
         _, vel_df = make_long_history(sym, exp, last_n=10)
         up_tbl = down_tbl = None
@@ -506,11 +746,11 @@ def render_app():
                 df_ring=df_ana, spot=working_spot, atm_idx_in_ring=atm_idx_ana, symbol=sym, expiry=exp,
                 up_n=6, down_n=6, lookback_frames=6, pass_threshold=0.85,
             )
-    
+       
         frames = get_last_frames(sym, exp, n=2)
         df_prev_for_flow = frames[-2] if len(frames) == 2 else None
         flows, net_flow = compute_vega_weighted_iv_flow(df_for_calc, df_prev_for_flow)
-    
+       
         # money map + walls + wall-shift velocity
         dfm = compute_money_map(df_for_calc)
         wall_tbl = find_walls(dfm, z_thresh=1.5, k=4) if not dfm.empty else pd.DataFrame()
@@ -519,7 +759,7 @@ def render_app():
             prev_dfm = compute_money_map(frames[-2])
             prev_walls = find_walls(prev_dfm, z_thresh=1.5, k=4)
         wsv = wall_shift_velocity(wall_tbl, prev_walls, working_spot) if not wall_tbl.empty else None
-    
+       
         # liquidity pack
         liq_stats = compute_spread_stats(df_for_calc, working_spot, band=3)
         icp = impact_cost_proxy(df_for_calc, working_spot, qty=50)
@@ -541,17 +781,17 @@ def render_app():
                 buf.append(float(stats["stress"]))
                 if len(buf) > 480:    # ~ a full day @ 1 per tick
                     del buf[:len(buf) - 480]
-    
+       
         # sentiment / PCR
         pcr_ring = compute_pcr(df_ana)
         sentiment, _writing_text = get_writing_commentary(df_ana)
-    
+       
         # phase & direction score
         minutes_since_open = (now2 - mstart).total_seconds() / 60.0 if mstart else None
         pin_top = float(probs["pin_prob"].iloc[0]) if (probs is not None and not probs.empty and "pin_prob" in probs.columns) else None
         phase = session_phase(minutes_since_open, iv_z, regime, pin_prob_top=pin_top)
-        dir_score = _direction_score(regime, iv_z, vel_df, up_tbl, down_tbl, net_flow, pcr_ring)
-    
+        dir_score = _direction_score_local(regime, iv_z, vel_df, up_tbl, down_tbl, net_flow, pcr_ring)
+       
         # ---------- headline narrative ----------
         gamma_label = "Long-gamma" if isinstance(regime, str) and "Long" in regime else ("Short-gamma" if isinstance(regime, str) and "Short" in regime else "Mixed")
         if gamma_label == "Long-gamma":
@@ -560,10 +800,10 @@ def render_app():
             st.markdown("**🔴 Short-gamma: trend/breakout risk; prefer momentum/debit structures.**")
         else:
             st.markdown("**⚖️ Mixed gamma: stay tactical; let rails & IV guide.**")
-    
-        if _isnum(pin_top) and pin_k is not None:
+       
+        if _isnum_local(pin_top) and pin_k is not None:
             st.markdown(f"🎯 **Pin risk** near **{int(pin_k)}** (top pin {_pct(pin_top)}).")
-    
+       
         # Mean-revert vs breakout label
         if dir_score <= 40:
             st.info("**Mean-revert bias ON** (score ≤40).")
@@ -571,7 +811,7 @@ def render_app():
             st.warning("**Directional bias ON** (score ≥60).")
         else:
             st.caption("Neutral/transition — wait for alignment (rails + IV + velocity).")
-    
+       
         # ---------- One-glance metric rows ----------
         a1, a2, a3 = st.columns([1.2, 1, 1])
         with a1:
@@ -586,56 +826,56 @@ def render_app():
             st.metric("Direction score", f"{dir_score}/100")
             if probs is not None and pin_k is not None:
                 st.metric("Pin target", f"{int(pin_k)}")
-    
+       
         b1, b2, b3 = st.columns(3)
         with b1:
             if not dfm.empty:
                 cm_p = money_center_of_mass(dfm, use_premium=True)
                 cm_o = money_center_of_mass(dfm, use_premium=False)
-                st.metric("Premium Center", f"{cm_p:.0f}" if _isnum(cm_p) else "–")
-                st.metric("OI Center", f"{cm_o:.0f}" if _isnum(cm_o) else "–")
+                st.metric("Premium Center", f"{cm_p:.0f}" if _isnum_local(cm_p) else "–")
+                st.metric("OI Center", f"{cm_o:.0f}" if _isnum_local(cm_o) else "–")
         with b2:
-            if _isnum(wsv):
+            if _isnum_local(wsv):
                 st.metric("Wall-shift velocity", f"{wsv:+.0f} pts")
-            if _isnum(net_flow):
+            if _isnum_local(net_flow):
                 st.metric("Net IV Flow", f"{net_flow:,.0f}")
         with b3:
-            if liq_data and _isnum(liq_data.get("median_spread_bps")):
+            if liq_data and _isnum_local(liq_data.get("median_spread_bps")):
                 st.metric("Median spread (bps)", f"{liq_data['median_spread_bps']:.0f}")
-            if liq_data and _isnum(liq_data.get("liquidity_stress")):
+            if liq_data and _isnum_local(liq_data.get("liquidity_stress")):
                 st.metric("Liquidity stress", f"{liq_data['liquidity_stress']*100:.0f} / 100")
-    
+       
         # ---------- Actionable bullets ----------
         bullets = []
         if "Short" in (regime or ""):
             bullets.append("Short-gamma: **breakouts expand**; prefer directional/debit structures.")
         elif "Long" in (regime or ""):
             bullets.append("Long-gamma: **mean-revert**; prefer fade/credit structures.")
-        if _isnum(iv_z) and abs(iv_z) >= 2.0:
+        if _isnum_local(iv_z) and abs(iv_z) >= 2.0:
             bullets.append(f"IV impulse z={iv_z:+.2f}: expect **larger range** than average.")
-        if _isnum(pin_top) and pin_top >= 0.35 and pin_k is not None:
+        if _isnum_local(pin_top) and pin_top >= 0.35 and pin_k is not None:
             bullets.append(f"High pin risk near **{int(pin_k)}** (**{_pct(pin_top)}**).")
-        if breakout and _isnum(breakout.get("prob_up_break")) and breakout["prob_up_break"] >= 0.55:
+        if breakout and _isnum_local(breakout.get("prob_up_break")) and breakout["prob_up_break"] >= 0.55:
             bullets.append("Upside breakout odds **>55%** vs 50% rail; look for **CE-unwind + PE-writing** on Runway.")
-        if _isnum(wsv) and wsv > 0:
+        if _isnum_local(wsv) and wsv > 0:
             bullets.append("Walls moving **toward** spot → compression/pin risk; **scalp edges**.")
-        if liq_data and _isnum(liq_data.get("median_spread_bps")) and liq_data["median_spread_bps"] > 120:
+        if liq_data and _isnum_local(liq_data.get("median_spread_bps")) and liq_data["median_spread_bps"] > 120:
             bullets.append("Wide spreads: **cut size** or wait for **liquidity pockets**.")
         if dir_score >= 60: bullets.append("**Directional bias ON** (score ≥60).")
         if dir_score <= 40: bullets.append("**Mean-revert bias ON** (score ≤40).")
-    
+       
         st.markdown("#### Actionable")
         if bullets:
             st.markdown("\n".join([f"- {b}" for b in bullets]))
         else:
             st.caption("Signals are mixed—be selective and wait for alignment (Runway + Velocity).")
-    
+       
         st.markdown("#### Invalidation / Flip")
         st.markdown(
             "- **Flip to trend** if 50% rail breaks **and** IV-z ≥ 2 **and** OI flow one-sided.\n"
             "- **Flip back to fade** if pushes fail and IV cools while GEX pulls price back toward magnet.\n"
         )
-    
+       
         # ---------- AI JSON payload (machine-readable) ----------
         ai_payload = {
             "meta": {
@@ -665,7 +905,7 @@ def render_app():
             },
             "pinning": {
                 "pin_target_strike": int(pin_k) if pin_k is not None else None,
-                "pin_top_probability": float(pin_top) if _isnum(pin_top) else None
+                "pin_top_probability": float(pin_top) if _isnum_local(pin_top) else None
             },
             "oi_walls": {
                 "wall_shift_velocity_pts": wsv,
@@ -768,17 +1008,17 @@ def render_app():
                     )
 
     # ---- 1% Execution Suite (additive; optional panel) ----
-    with st.expander("1% Execution Suite (edge ÷ pressure, size planner, INR slip)", expanded=False):
+    with st.expander("1% Execution Suite (edge ÷ pressure, size planner, INR slip)", expanded=True):
         lot = st.number_input("Lot size", min_value=1, value=25, step=1, key="onepct_lot")
         bps = st.number_input("Max slippage (bps)", min_value=1.0, value=10.0, step=1.0, key="onepct_bps")
 
         # Use the same analytics ring you already derived
         df_for_calc = df_ana if not df_ana.empty else df
 
-        dfp = liquidity_stress_v2(df_for_calc)                         # dials + liquidity_pressure_v2
-        dfp = estimate_rupee_impact(dfp, lot_size=int(lot))            # rupee_impact_per_lot
+        dfp = liquidity_stress_v2(df_for_calc)                  # dials + liquidity_pressure_v2
+        dfp = estimate_rupee_impact(dfp, lot_size=int(lot))     # rupee_impact_per_lot
         dfp = plan_order_sizes(dfp, max_slippage_bps=float(bps), lot_size=int(lot))  # max_lots_under_slippage
-        ranked = rank_strikes_by_edge_pressure(dfp)                    # edge_per_pressure, rank_epp
+        ranked = rank_strikes_by_edge_pressure(dfp)                 # edge_per_pressure, rank_epp
 
         c1, c2 = st.columns(2)
         with c1:
@@ -833,7 +1073,7 @@ def render_app():
             st.markdown(
                 f"""
                 <div style='background-color:#f8f9fa; padding:6px 10px; border-radius:8px; 
-                            border:1px solid #ddd; font-size:0.9rem;'>
+                             border:1px solid #ddd; font-size:0.9rem;'>
                     <b>🎯 Cones:</b> 
                     <span style='color:#2c3e50;'>25% → <b>{c[0.25][0]:.0f}</b> ↔ <b>{c[0.25][1]:.0f}</b></span> &nbsp;|&nbsp;
                     <span style='color:#2980b9;'>50% → <b>{c[0.50][0]:.0f}</b> ↔ <b>{c[0.50][1]:.0f}</b></span> &nbsp;|&nbsp;
@@ -1270,9 +1510,9 @@ def render_app():
         rr, bf = compute_rr_bf(df_for_calc)
         cc1, cc2 = st.columns(2)
         cc1.metric("Risk Reversal (25Δ)", f"{rr:+.2f} pts" if rr is not None else "–",
-                    help="σ(25Δ put) − σ(25Δ call). Positive = puts richer.")
+                   help="σ(25Δ put) − σ(25Δ call). Positive = puts richer.")
         cc2.metric("Butterfly (25Δ)", f"{bf:+.2f} pts" if bf is not None else "–",
-                    help="Smile curvature: 0.5*(σ25P+σ25C) − σATM")
+                   help="Smile curvature: 0.5*(σ25P+σ25C) − σATM")
         if not iv_hist.empty and {"rr","bf"}.issubset(iv_hist.columns):
             rr_df = iv_hist.dropna(subset=["rr"])
             bf_df = iv_hist.dropna(subset=["bf"])
@@ -1319,11 +1559,11 @@ def render_app():
 # --------------------------- Commentary (AI payload + emoji) ---------------------------
     with tab_commentary:
         st.subheader("Commentary (AI payload + quick glance)")
-    
+       
         # Cash OHLC (for day range + LTP)
-        cash_ohlc = _fetch_cash_ohlc(api_base, sym, inst)  # {"open","high","low","ltp"} or None
+        cash_ohlc = None if source == "Historical API" else _fetch_cash_ohlc(api_base, sym, inst)
         fut_ohlc = None  # optional, set if you later add a futures OHLC endpoint
-    
+       
         # Recompute a few things we need (cheap ops)
         df_for_calc = df_ana if not df_ana.empty else df
         atm_iv_now = compute_atm_iv(df_for_calc, working_spot)
@@ -1333,13 +1573,13 @@ def render_app():
         minutes_left = max(1, (mend - now).total_seconds() / 60.0) if mend else 60
         rails = compute_iv_rails(working_spot, atm_iv_now, minutes_left)
         regime, _gex = compute_gamma_regime(df_for_calc, working_spot, ring_size=fixed_skew_ring)
-    
+       
         # Expected move + breakout
         em = expected_move_nowcast(working_spot, atm_iv_now, minutes_left)
         breakout_probs_dict = breakout_probabilities(
             working_spot, rails.get(0.50) if rails else None, (em or {}).get("sigma_pts")
         ) if rails and em else None
-    
+       
         # GEX + pin probs
         gc = gex_curve(df_for_calc, working_spot)
         pin_table_list = []
@@ -1347,12 +1587,12 @@ def render_app():
             probs_df, pin_k = pin_probability(gc, working_spot, em["sigma_pts"])
             if probs_df is not None and not probs_df.empty:
                 pin_table_list = [{"strike": float(r.strike), "prob": float(r.pin_prob)} for _, r in probs_df.head(5).iterrows()]
-    
+       
         # Supports / resistances summary
         sup_zones, res_zones = summarize_zones(df_for_calc, top_n=2)
         supports = sup_zones or []
         resistances = res_zones or []
-    
+       
         # Money map, walls, wall-shift velocity (vs previous ring)
         dfm = compute_money_map(df_for_calc)
         walls_tbl = find_walls(dfm, z_thresh=1.5, k=4) if not dfm.empty else pd.DataFrame()
@@ -1366,7 +1606,7 @@ def render_app():
             prev_dfm = compute_money_map(prev_frames[-2])
             prev_walls_tbl = find_walls(prev_dfm, z_thresh=1.5, k=4) if not prev_dfm.empty else pd.DataFrame()
         wsv = wall_shift_velocity(walls_tbl, prev_walls_tbl, working_spot) if not walls_tbl.empty else None
-    
+       
         premium_center = money_center_of_mass(dfm, use_premium=True) if not dfm.empty else None
         oi_center = money_center_of_mass(dfm, use_premium=False) if not dfm.empty else None
         top_prem_stock = []
@@ -1376,7 +1616,7 @@ def render_app():
                 top_prem_stock = dfm.nlargest(3, "prem_stock")[["strike","prem_stock"]].assign(value=lambda x:x["prem_stock"]).drop(columns=["prem_stock"]).to_dict("records")
             if "prem_new" in dfm.columns:
                 top_prem_new = dfm.nlargest(3, "prem_new")[["strike","prem_new"]].assign(value=lambda x:x["prem_new"]).drop(columns=["prem_new"]).to_dict("records")
-    
+       
         # Momentum/velocity (last N)
         _, vel_df_local = make_long_history(sym, exp, last_n=10)
         vel_up_sum = float(vel_df_local[vel_df_local["velocity"]>0]["velocity"].sum()) if not vel_df_local.empty else 0.0
@@ -1384,7 +1624,7 @@ def render_app():
         vel_tilt = (vel_up_sum - vel_dn_sum) / max(1e-9, (vel_up_sum + vel_dn_sum)) if (vel_up_sum + vel_dn_sum) > 0 else 0.0
         spikes_tbl = velocity_spike_table(vel_df_local, k=5, threshold=None) if not vel_df_local.empty else pd.DataFrame()
         vel_spikes = [{"strike": float(r["strike"]), "abs_value": float(abs(r["velocity"])), "side": "PE" if r["velocity"]>0 else "CE"} for _, r in spikes_tbl.iterrows()] if not spikes_tbl.empty else []
-    
+       
         # IV flow
         frames2 = get_last_frames(sym, exp, n=2)
         df_prev_for_flow = frames2[-2] if len(frames2) == 2 else None
@@ -1393,33 +1633,33 @@ def render_app():
         if not flows.empty:
             flows_plot = flows.assign(abs_flow=lambda x: x["flow"].abs()).nlargest(5, "abs_flow")
             iv_top_flows = [{"strike": float(r["strike"]), "side": r["side"], "flow": float(r["flow"])} for _, r in flows_plot.iterrows()]
-    
+       
         # Liquidity pack
         liq_stats = compute_spread_stats(df_for_calc, working_spot, band=3)
         icp = impact_cost_proxy(df_for_calc, working_spot, qty=50)
         median_spread_bps = liq_stats.get("median_spread_bps") if liq_stats else None
         impact_bps_50qty = icp.get("ic_bps") if icp else None
         liq_stress = liquidity_stress(median_spread_bps, impact_bps_50qty, dfm) if (median_spread_bps and impact_bps_50qty and not dfm.empty) else None
-    
+       
         # Realized vol gap
         buf = st.session_state.get("spot_hist", {}).get(f"{sym}:{exp}")
         rv = realized_vol_annualized(list(buf)) if buf else None
         iv_minus_rv = (atm_iv_now - rv) if (atm_iv_now is not None and rv is not None) else None
-    
+       
         # meta & clock
         minutes_since_open = (now - mstart).total_seconds()/60.0 if mstart else None
         minutes_to_close = (mend - now).total_seconds()/60.0 if mend else None
-    
+       
         # pin probability top (for phase)
         pin_top = (pin_table_list[0]["prob"] if pin_table_list else None)
         phase = session_phase(minutes_since_open, iv_z, regime, pin_prob_top=pin_top)
-    
+       
         meta = {
             "symbol": sym, "instrument": inst.upper(), "expiry": exp,
             "timestamp": ts, "source": source, "dte_days": None, "session_phase": phase
         }
         market_clock = {"minutes_since_open": minutes_since_open, "minutes_to_close": minutes_to_close}
-    
+       
         # Build payload (first pass)
         payload = _build_commentary_json_v2(
             meta=meta, market_clock=market_clock,
@@ -1443,18 +1683,18 @@ def render_app():
             direction_score=None, bias=None, tags=None,
             decision=None, data_quality={"missing": []}
         )
-    
+       
         # Tags + decision + scores
         score, bias, tags, decision = _auto_tags_and_decision(payload)
         payload["derived"]["direction_score_0_100"] = score
         payload["derived"]["bias"] = bias
         payload["derived"]["tags"] = tags
         payload["decision"] = decision
-    
+       
         # Human glance (emoji)
         st.markdown("#### Quick glance")
         st.text(_emoji_summary(payload))
-    
+       
         # JSON pretty + download
         st.markdown("#### AI payload (JSON v2)")
         pretty = json.dumps(payload, indent=2, ensure_ascii=False)
@@ -1542,8 +1782,8 @@ def _day_range_position(cash_ohlc: dict, working_spot: float):
 
 def _build_commentary_json_v2(
     *,
-    meta, market_clock,           # dicts
-    working_spot, basis,          # floats/None
+    meta, market_clock,          # dicts
+    working_spot, basis,           # floats/None
     cash_ohlc=None, fut_ohlc=None,
     atm_strike=None, supports=None, resistances=None, max_pain=None, gex_pin=None,
     atm_iv=None, iv_z=None, rr25=None, bf25=None, iv_minus_rv=None,
